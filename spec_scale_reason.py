@@ -253,11 +253,6 @@ parser.add_argument("--output_dir", type=str, default="results/spec_scale_Inf",
                     help="Where result pickle files will be written to")
 args, _ = parser.parse_known_args()
 
-if not os.path.exists(args.output_dir):
-    os.makedirs(args.output_dir)
-
-args.dataset = get_dataset(args.dataset_name)
-
 # 初始化模型
 logging.info("正在初始化模型...")
 models = {}
@@ -285,6 +280,7 @@ except Exception as e:
     exit(1)
 
 # %%
+args.dataset = get_dataset(args.dataset_name)
 if args.dataset_name == "aime":
     problem = args.dataset["problem"][args.problem_id - 60]
     options = None
@@ -302,8 +298,10 @@ elif args.dataset_name == "gpqa":
 
 problem_id = f"{args.dataset_name}_{args.problem_id}"
 
-
-output_filename = os.path.join(args.output_dir, f"{args.problem_id}/{args.repeat_id}")
+output_dir = os.path.join(args.output_dir, args.dataset_name)
+if not os.path.exists(output_dir):
+    os.makedirs(output_dir)
+output_filename = os.path.join(output_dir, f"{args.problem_id}-{args.repeat_id}")
 if os.path.exists(f"{output_filename}.pickle"):
     logging.info(f"Problem {args.problem_id} repeat {args.repeat_id} resolved, exiting")
     exit()
