@@ -1,3 +1,5 @@
+# python spec_scale_reason.py --dataset_name aime --problem_id 60 --repeat_id 1 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
+
 # %%
 import os
 import time
@@ -14,18 +16,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
-import torch
+import re
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def get_avg_score(scores):
-    return statistics.mean([x for x in scores if x is not None])
-
-def get_frequency(scores):
-    return dict(Counter(scores))
-
-def get_model(model_size):
-    return models[model_size]  # 直接返回vLLM模型实例
 
 def get_first_user_msg(problem, options=None, role_type=1):
     from prompts.role_prompts import role_prompt_1, role_prompt_2, role_prompt_3
@@ -151,7 +144,9 @@ def get_score_parallel(args, problem, steps_so_far, model_size="32b", options=No
 def process_vllm_logprobs(token, logprobs, method, temp=1.0):
     """处理vLLM返回的logprobs"""
     # 过滤出数字token的概率
-    digit_logprobs = {k: v for k, v in logprobs.items() if k.isdigit()}
+    print(logprobs)
+    print(token)
+    digit_logprobs = {k: v for k, v in logprobs.items()}
     
     if method == "greedy":
         # 返回生成的token
@@ -174,6 +169,52 @@ def process_vllm_logprobs(token, logprobs, method, temp=1.0):
         return avg_score
     else:
         raise NotImplementedError
+
+def select_best_result(results):
+    """根据指定规则选择最佳结果"""
+    # 过滤出成功完成的结果
+    finished_results = [r for r in results if r.get("stop_reason") == "finished" and r.get("answer") is not None]
+    
+    if not finished_results:
+        logging.warning("所有推理都未能完成或提取答案")
+        return None
+    
+    # 统计答案
+    answers = [r.get("answer") for r in finished_results]
+    answer_counts = Counter(answers)
+    
+    # 如果有答案相同的，取多数
+    if len(answer_counts) < len(finished_results):
+        most_common_answer, count = answer_counts.most_common(1)[0]
+        if count > 1:  # 确保至少有两个相同答案
+            # 找出具有最常见答案的所有结果
+            selected_results = [r for r in finished_results if r.get("answer") == most_common_answer]
+            # 从中选择token数最多的
+            selected_result = max(selected_results, key=lambda r: r.get("num_tokens", 0))
+            selected_result["selection_reason"] = f"多数原则: {count}/{len(finished_results)}个结果给出相同答案"
+            return selected_result
+    
+    # 如果答案各不相同，取token数最多的
+    selected_result = max(finished_results, key=lambda r: r.get("num_tokens", 0))
+    selected_result["selection_reason"] = "答案各不相同，选择token数最多的结果"
+    return selected_result
+
+def extract_answer(reasoning):
+    """从推理文本中提取最终答案"""
+    if not reasoning:
+        return None
+        
+    # 使用正则表达式查找 \boxed{answer} 模式
+    match = re.search(r"\\boxed\{(.+?)\}", reasoning)
+    if match:
+        answer = match.group(1).strip()
+        return answer
+    else:
+        # 备用方案：检查最后一步是否包含"Answer: X"
+        match_answer = re.search(r"[Aa]nswer:\s*([A-Za-z0-9]+)", reasoning)
+        if match_answer:
+            return match_answer.group(1).upper()
+        return None
 
 def get_dataset(dataset_name):
     if dataset_name == "aime":
@@ -208,7 +249,7 @@ parser.add_argument("--repeat_id", type=int, default=0,
                     help="Repeat ID (0-15, k=16)")
 parser.add_argument("--score_method", type=str, choices=["greedy", "average"], default="greedy",
                     help="Scoring method")
-parser.add_argument("--output_dir", type=str, default="results/only_Inf", 
+parser.add_argument("--output_dir", type=str, default="results/spec_scale_Inf", 
                     help="Where result pickle files will be written to")
 args, _ = parser.parse_known_args()
 
@@ -216,6 +257,32 @@ if not os.path.exists(args.output_dir):
     os.makedirs(args.output_dir)
 
 args.dataset = get_dataset(args.dataset_name)
+
+# 初始化模型
+logging.info("正在初始化模型...")
+models = {}
+try:
+    # 初始化小模型
+    logging.info("正在加载1.5b模型...")
+    models["1.5b"] = LLM(
+        model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+        tensor_parallel_size=4,  # 根据您的GPU数量调整
+        gpu_memory_utilization=0.1,
+        trust_remote_code=True
+    )
+    
+    # 初始化大模型
+    logging.info("正在加载32b模型...")
+    models["32b"] = LLM(
+        model="Qwen/QwQ-32B",
+        tensor_parallel_size=4,  # 根据您的GPU数量调整
+        gpu_memory_utilization=0.8,
+        trust_remote_code=True
+    )
+    logging.info("模型初始化完成")
+except Exception as e:
+    logging.error(f"模型初始化失败: {e}")
+    exit(1)
 
 # %%
 if args.dataset_name == "aime":
@@ -242,103 +309,283 @@ if os.path.exists(f"{output_filename}.pickle"):
     exit()
     
 steps_so_far = []
-step_id = 0
-metadata_list = []
-
-model_names = {
-    "1.5b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-    "32b": "Qwen/QwQ-32B",
-}
-
-# 初始化vLLM模型
-models = {}
-for size, full_name in model_names.items():
-    # 根据模型大小选择合适的配置
-    tensor_parallel_size = 2
-    
-    models[size] = LLM(
-        model=full_name,
-        tensor_parallel_size=tensor_parallel_size,
-        gpu_memory_utilization=0.9,  # 可以根据实际情况调整
-        trust_remote_code=True,
-        dtype="bfloat16",  # 或者 "float16"，根据您的硬件支持情况选择
-    )
-    logging.info(f"已加载模型 {full_name}")
-
-
 start_time_total = time.time()  # 记录整个过程的开始时间
 try:
+    # 为每个角色创建独立的推理轨道
+    role_tracks = {
+        1: {"steps": [], "finished": False, "metadata": []},
+        2: {"steps": [], "finished": False, "metadata": []},
+        3: {"steps": [], "finished": False, "metadata": []}
+    }
+    
+    step_id = 0
+    
     while True:
-        warning_flag = False
+        # 检查是否所有轨道都已完成
+        active_roles = [role for role, track in role_tracks.items() if not track["finished"]]
+        if not active_roles:
+            break
+            
+        logging.info(f"[Step {step_id}] 活跃角色: {active_roles}")
         
-        # 1. generate a reasoning step using a small model
-        step_str, finished, num_output_tokens = generate_new_step_parallel(problem, steps_so_far, "1.5b", options=options)
-        small_model_step, num_output_tokens_small = step_str, num_output_tokens
-
-        # 2. use the base model to score the step
-        score, justification, response = get_score_parallel(args, problem, steps_so_far + [step_str], options=options)
+        # 1. 为每个活跃角色并行生成下一步推理
+        active_prompts = []
+        role_mapping = []  # 用于跟踪每个提示对应的角色
         
-        # 3. if over a threshold, accept. else, generate a reasoning step using the base model.
-        if score is not None and score >= args.score_threshold:
-            logging.info(f"[Step {step_id}] score {score}, accepted!")
-            base_model_step, num_output_tokens_base = None, None
-        else:
-            logging.info(f"[Step {step_id}] score {score} rejected, falling back to base model")
-            step_str, finished, num_output_tokens = generate_new_step_parallel(problem, steps_so_far, "32b", options=options)
-            base_model_step, num_output_tokens_base = step_str, num_output_tokens
-        # NOTE(ruipan): potential optimization is to pipeline the decoding of these two models rather than sequentially
+        for role in active_roles:
+            track = role_tracks[role]
+            if not track["steps"]:  # 第一步
+                prompt = get_first_user_msg(problem, options, role_type=role)
+            else:  # 继续之前的消息
+                steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
+                prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}"
+            
+            active_prompts.append(prompt)
+            role_mapping.append(role)
         
-        if "</think>" in step_str and not any([x in step_str for x in ["boxed", "Answer:", "ANSWER:"]]):
-            # FIXME(ruipan): handles a very rare edge case of generating a stop thinking token midway through answering.
-            # Although it could be that thinking finished, but the last step didn't format the answer with \boxed{}
-            logging.warning(f"Warning: step_str had a </think>, removing. {step_str}")
-            step_str = step_str.replace("</think>", "")
-            warning_flag = True
+        # 设置采样参数
+        sampling_params = SamplingParams(
+            temperature=0.6,
+            top_p=0.95,
+            max_tokens=512,
+            stop=["\n\n"]
+        )
         
-        # 4. repeat until an answer gets generated in the response
-        steps_so_far.append(step_str)
-        logging.info(f"[Step {step_id}] final step_str: {step_str}")
+        # 批量生成小模型的推理步骤
+        small_outputs = models["1.5b"].generate(active_prompts, sampling_params)
         
-        metadata = {
-            "step_id": step_id,
-            "step_str": step_str,
-            "small_model_step": small_model_step,
-            "num_output_tokens_small": num_output_tokens_small,
-            "score": score,
-            "base_model_step": base_model_step,
-            "num_output_tokens_base": num_output_tokens_base,
-            "final_num_output_tokens": num_output_tokens_base if num_output_tokens_base is not None else num_output_tokens_small,
-            "justification": justification,
-        }
-        if warning_flag:
-            metadata["warning"] = "step_str had a </think>"
-        metadata_list.append(metadata)
+        # 2. 处理小模型输出并准备评分
+        score_prompts = []
+        score_role_mapping = []
+        small_results = {}
+        
+        for i, output in enumerate(small_outputs):
+            role = role_mapping[i]
+            generated_text = output.outputs[0].text
+            num_tokens = len(output.outputs[0].token_ids)
+            
+            # 检查是否完成
+            finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
+            
+            # 存储小模型结果
+            small_results[role] = {
+                "text": generated_text,
+                "tokens": num_tokens,
+                "finished": finished
+            }
+            
+            # 准备评分提示
+            track = role_tracks[role]
+            steps_for_scoring = track["steps"] + [generated_text]
+            steps_so_far_str = "\n\n".join(steps_for_scoring) + "\n\n"
+            
+            score_prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
+            
+            score_prompts.append(score_prompt)
+            score_role_mapping.append(role)
+        
+        # 3. 批量评分
+        scoring_params = SamplingParams(
+            temperature=0.0,
+            max_tokens=1,
+            logprobs=10
+        )
+        
+        score_outputs = models["32b"].generate(score_prompts, scoring_params)
+        
+        # 4. 处理评分结果，确定哪些需要重写
+        rewrite_prompts = []
+        rewrite_role_mapping = []
+        scores = {}
+        
+        for i, output in enumerate(score_outputs):
+            role = score_role_mapping[i]
+            token = output.outputs[0].text
+            logprobs = output.outputs[0].logprobs[0]
+            
+            score = process_vllm_logprobs(token, logprobs, method=args.score_method)
+            scores[role] = score
+            
+            # 如果分数低于阈值，需要重写
+            if score is None or score < args.score_threshold:
+                logging.info(f"[Step {step_id}] 角色 {role} 分数 {score}，需要重写")
+                track = role_tracks[role]
+                
+                if not track["steps"]:  # 第一步
+                    prompt = get_first_user_msg(problem, options, role_type=role)
+                else:  # 继续之前的消息
+                    steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
+                    prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}"
+                
+                rewrite_prompts.append(prompt)
+                rewrite_role_mapping.append(role)
+            else:
+                logging.info(f"[Step {step_id}] 角色 {role} 分数 {score}，已接受")
+        
+        # 5. 如果有需要重写的，批量重写
+        rewrite_results = {}
+        if rewrite_prompts:
+            rewrite_outputs = models["32b"].generate(rewrite_prompts, sampling_params)
+            
+            for i, output in enumerate(rewrite_outputs):
+                role = rewrite_role_mapping[i]
+                generated_text = output.outputs[0].text
+                num_tokens = len(output.outputs[0].token_ids)
+                
+                # 检查是否完成
+                finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
+                
+                rewrite_results[role] = {
+                    "text": generated_text,
+                    "tokens": num_tokens,
+                    "finished": finished
+                }
+        
+        # 6. 更新每个角色的轨道
+        for role in active_roles:
+            track = role_tracks[role]
+            
+            # 确定最终使用的步骤
+            if role in rewrite_results:
+                # 使用重写的结果
+                step_text = rewrite_results[role]["text"]
+                num_tokens = rewrite_results[role]["tokens"]
+                finished = rewrite_results[role]["finished"]
+                used_base_model = True
+            else:
+                # 使用小模型的结果
+                step_text = small_results[role]["text"]
+                num_tokens = small_results[role]["tokens"]
+                finished = small_results[role]["finished"]
+                used_base_model = False
+            
+            # 处理特殊情况
+            if "</think>" in step_text and not any([x in step_text for x in ["boxed", "Answer:", "ANSWER:"]]):
+                logging.warning(f"Warning: 角色 {role} 的步骤包含 </think>，正在移除")
+                step_text = step_text.replace("</think>", "")
+                warning_flag = True
+            else:
+                warning_flag = False
+            
+            # 添加到轨道的步骤中
+            track["steps"].append(step_text)
+            
+            # 创建元数据
+            metadata = {
+                "step_id": step_id,
+                "role_type": role,
+                "step_str": step_text,
+                "small_model_step": small_results[role]["text"],
+                "num_output_tokens_small": small_results[role]["tokens"],
+                "score": scores[role],
+                "base_model_step": rewrite_results.get(role, {}).get("text") if used_base_model else None,
+                "num_output_tokens_base": rewrite_results.get(role, {}).get("tokens") if used_base_model else None,
+                "final_num_output_tokens": num_tokens,
+                "used_base_model": used_base_model
+            }
+            
+            if warning_flag:
+                metadata["warning"] = "step_str had a </think>"
+            
+            track["metadata"].append(metadata)
+            
+            # 检查是否完成
+            if finished:
+                track["finished"] = True
+                track["stop_reason"] = "finished"
+            elif len(track["steps"]) > 2 and track["steps"][-1] == track["steps"][-2]:
+                # 处理重复步骤的边缘情况
+                track["finished"] = True
+                track["stop_reason"] = "repeated"
+            elif sum([m["final_num_output_tokens"] for m in track["metadata"]]) >= args.token_budget:
+                track["finished"] = True
+                track["stop_reason"] = "budget"
+        
         step_id += 1
         
-        if len(steps_so_far) > 2:
-            finished = finished or steps_so_far[-1] == steps_so_far[-2]  # NOTE(ruipan): handles another edge case where model repeats previous reasoning steps
-        
-        if finished or sum([m["final_num_output_tokens"] for m in metadata_list]) >= args.token_budget:
-            if sum([m["final_num_output_tokens"] for m in metadata_list]) >= args.token_budget:
-                metadata_list[-1]["stop_reason"] = "budget"
-            else:
-                metadata_list[-1]["stop_reason"] = "finished"
-            break
-except ValueError:
-    logging.error(f"ValueError caught in chat template application, continuing")
+except ValueError as e:
+    logging.error(f"ValueError caught in chat template application: {e}")
 
+# 计算总时间和统计信息
 total_time = time.time() - start_time_total
-total_tokens = sum([m["final_num_output_tokens"] for m in metadata_list])
 
+# 合并所有角色的元数据
+all_metadata = []
+for role, track in role_tracks.items():
+    for metadata in track["metadata"]:
+        all_metadata.append(metadata)
+
+# 为每个角色选择最终结果
+final_results = {}
+for role, track in role_tracks.items():
+    if track["finished"]:
+        # 提取答案
+        answer = extract_answer("\n\n".join(track["steps"]))
+        
+        final_results[role] = {
+            "steps": track["steps"],
+            "metadata": track["metadata"],
+            "stop_reason": track.get("stop_reason", "unknown"),
+            "answer": answer,
+            "total_tokens": sum([m["final_num_output_tokens"] for m in track["metadata"]])
+        }
+
+# 选择最佳结果
+best_results = [
+    {
+        "role_type": role,
+        "reasoning": "\n\n".join(result["steps"]),
+        "answer": result["answer"],
+        "num_tokens": result["total_tokens"],
+        "stop_reason": result["stop_reason"]
+    }
+    for role, result in final_results.items()
+    if result["answer"] is not None
+]
+
+best_result = select_best_result(best_results) if best_results else None
+
+# 记录结果
+logging.info("=" * 50)
+logging.info("时间统计信息:")
+logging.info(f"问题ID: {args.problem_id}, 重复ID: {args.repeat_id}")
 logging.info(f"总时间: {total_time:.2f}秒")
-logging.info(f"最终推理结果总token数: {total_tokens}")
+
+for role, result in final_results.items():
+    tokens = result["total_tokens"]
+    logging.info(f"角色 {role}:")
+    logging.info(f"  - 总token数: {tokens}")
+    logging.info(f"  - 停止原因: {result['stop_reason']}")
+    if result["answer"]:
+        logging.info(f"  - 答案: {result['answer']}")
+
+if best_result:
+    logging.info(f"选择的角色: {best_result['role_type']}")
+    logging.info(f"选择原因: {best_result.get('selection_reason', '未知')}")
+    logging.info(f"最终答案: {best_result.get('answer', '无法提取')}")
+else:
+    logging.info("无法选择有效结果: 所有推理都失败")
+
+logging.info("=" * 50)
+
+# 保存结果
+metadata_with_stats = {
+    "reasoning": best_result if best_result else {"reasoning": "所有推理都失败", "stop_reason": "failed"},
+    "time_stats": {
+        "total_time": total_time,
+        "role_results": final_results,
+        "selected_role": best_result.get("role_type") if best_result else None,
+        "selection_reason": best_result.get("selection_reason") if best_result else "所有推理都失败"
+    },
+    "all_metadata": all_metadata  # 保存所有步骤的详细信息
+}
 
 os.makedirs(os.path.dirname(f"{output_filename}.pickle"), exist_ok=True)
 
 with open(f"{output_filename}.pickle", "wb") as f:
-    pickle.dump(metadata_list, f)
+    pickle.dump(metadata_with_stats, f)
 
 with open(f"{output_filename}.txt", "w") as f:
-    pprint.pprint(metadata_list, stream=f)
+    pprint.pprint(metadata_with_stats, stream=f)
 
 

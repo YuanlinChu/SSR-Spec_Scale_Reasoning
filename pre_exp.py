@@ -1,3 +1,5 @@
+# python pre_exp.py --dataset_name aime --problem_id 60 --repeat_id 1 --model_size 32b --token_budget 8192
+
 # %%
 import os
 import time
@@ -344,7 +346,7 @@ def main():
                         help="每个问题重复执行的次数")
     parser.add_argument("--model_size", type=str, choices=["1.5b", "32b"], default="32b",
                         help="用于推理的模型大小")
-    parser.add_argument("--output_dir", type=str, default="results/baseline_test", 
+    parser.add_argument("--output_dir", type=str, default="results/scale_test", 
                         help="结果pickle文件的写入位置")
     args, _ = parser.parse_known_args()
     
