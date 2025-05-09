@@ -1,10 +1,3 @@
-# SpecReason
-
-This repo contains a proof-of-concept example of the system described in the paper [SpecReason: Fast and Accurate Inference-Time Compute via Speculative Reasoning](https://arxiv.org/abs/2504.07891).
-
-
-## Getting started
-
 ### Environment setup
 
 - Create a conda environment: `conda create -n specreason python=3.12 -y`
@@ -15,7 +8,8 @@ This repo contains a proof-of-concept example of the system described in the pap
 
 ### Launching vLLM servers
 
-The script `spec_reason.py` requires two vLLM engines to be up and running. We use the following command to launch a 32B base model and a 1.5B small model on two A6000-48GB GPUs, both with TP=2.
+The script `base_reason_test.py` requires two vLLM engines to be up and running. 
+Use the following command to launch a 32B base model and a 1.5B small model, both with TP=2.
 
 You might need to adjust the ratio of how the KV cache memory space is partitioned (`--gpu-memory-utilization 0.1`) according to your hardware setup.
 
@@ -26,21 +20,4 @@ VLLM_USE_V1=0 vllm serve deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --dtype auto 
 
 ### Running SpecReason
 
-```
-mkdir results
-OUTPUT_DIR=./results
-python spec_reason.py --dataset_name aime --problem_id 60 --repeat_id 0 --score_threshold 7.0 --score_method greedy --token_budget 8192 --output_dir "$OUTPUT_DIR"
-```
-
-## References
-
-```
-@article{pan2025specreason,
-  title={SpecReason: Fast and Accurate Inference-Time Compute via Speculative Reasoning},
-  author={Pan, Rui and Dai, Yinwei and Zhang, Zhihao and Oliaro, Gabriele and Jia, Zhihao and Netravali, Ravi},
-  journal={arXiv preprint arXiv:2504.07891},
-  year={2025}
-}
-```
-
- python spec_reason.py --dataset_name aime --problem_id 61 --repeat_id 0 --score_threshold 9.0 --score_method greedy --token_budget 8192 --output_dir results
+python base_reason_test.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_size 32b --output_dir results/baseline_test

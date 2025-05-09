@@ -63,6 +63,84 @@ def get_first_user_msg(problem, options=None, role_type=1):
             ans_d=options["D"],
         )
 
+# def generate_new_step_parallel(problem, steps_so_far, model_size, options=None, stop_token="\n\n"):
+#     model = models[model_size]
+
+#     # start_time = time.time()
+#     # 创建三个不同角色的提示
+#     prompts = []
+#     for role_type in [1, 2, 3]:
+#         if steps_so_far == []:  # first step
+#             prompt = get_first_user_msg(problem, options, role_type=role_type)
+#         else:  # continuing on from a previous message
+#             steps_so_far_str = "\n\n".join(steps_so_far) + "\n\n"
+#             # 根据vLLM的格式构建提示，可能需要调整
+#             prompt = f"{get_first_user_msg(problem, options, role_type=role_type)}\n<think>{steps_so_far_str}"
+        
+#         prompts.append(prompt)
+    
+#     # 设置采样参数
+#     sampling_params = SamplingParams(
+#         temperature=0.6,
+#         top_p=0.95,
+#         max_tokens=512,
+#         stop=[stop_token]           #这里可能会有达到512还没有出现stop_token的情况
+#     )
+    
+#     # 批量生成
+#     outputs = model.generate(prompts, sampling_params)
+    
+#     # 处理输出结果
+#     results = []
+#     total_tokens = 0
+#     is_finished = False
+    
+#     for output in outputs:
+#         generated_text = output.outputs[0].text
+#         # 计算生成的token数量
+#         num_output_tokens = len(output.outputs[0].token_ids)
+        
+#         # 检查是否完成
+#         finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
+        
+#         results.append((generated_text, finished, num_output_tokens))
+#         total_tokens += num_output_tokens
+#         if finished:
+#             is_finished = True
+    
+#     # elapsed_time = time.time() - start_time
+    
+#     return results, is_finished, total_tokens
+
+# # 同样修改评分函数
+# def get_score_parallel(args, problem, steps_so_far, model_size="32b", options=None):
+#     """使用vLLM原生API进行评分"""
+#     model = models[model_size]
+    
+#     steps_so_far_str = "\n\n".join(steps_so_far) + "\n\n"
+    
+#     # 构建评分提示
+#     prompt = f"{get_first_user_msg(problem, options)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
+    
+#     # 设置采样参数，使用logprobs获取概率分布
+#     sampling_params = SamplingParams(
+#         temperature=0.0,
+#         max_tokens=1,
+#         logprobs=10  # 获取前10个最可能的token的概率
+#     )
+    
+#     # 生成评分
+#     output = model.generate([prompt], sampling_params)[0]
+    
+#     # 获取生成的token及其概率
+#     generated_token = output.outputs[0].text
+#     token_logprobs = output.outputs[0].logprobs[0]
+    
+#     # 处理logprobs
+#     score = process_vllm_logprobs(generated_token, token_logprobs, method=args.score_method)
+    
+#     return score, generated_token, output
+
 def process_vllm_logprobs(token, logprobs, method, temp=1.0):
     """处理vLLM返回的logprobs"""
     # 过滤出数字token的概率
@@ -118,6 +196,23 @@ def select_best_result(results):
     selected_result = max(finished_results, key=lambda r: r.get("num_tokens", 0))
     selected_result["selection_reason"] = "答案各不相同，选择token数最多的结果"
     return selected_result
+
+def extract_answer(reasoning):
+    """从推理文本中提取最终答案"""
+    if not reasoning:
+        return None
+        
+    # 使用正则表达式查找 \boxed{answer} 模式
+    match = re.search(r"\\boxed\{(.+?)\}", reasoning)
+    if match:
+        answer = match.group(1).strip()
+        return answer
+    else:
+        # 备用方案：检查最后一步是否包含"Answer: X"
+        match_answer = re.search(r"[Aa]nswer:\s*([A-Za-z0-9]+)", reasoning)
+        if match_answer:
+            return match_answer.group(1).upper()
+        return None
 
 def extract_final_answer(reasoning, dataset_name):
     """从推理文本中提取最终答案"""
@@ -511,6 +606,7 @@ def process_results(role_tracks, total_time, avg_rewrite_rate, args, problem, op
     for role, track in role_tracks.items():
         if track["finished"]:
             # 提取答案
+            # answer = extract_answer("\n\n".join(track["steps"]))
             answer = extract_final_answer("\n\n".join(track["steps"]), args.dataset_name)
             
             final_results[role] = {

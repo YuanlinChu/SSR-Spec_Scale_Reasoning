@@ -1,50 +1,21 @@
-#python base_reason_test.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_size 32b --output_dir results/baseline_test
+#python base_test.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name Qwen/QwQ-32B --output_dir results/baseline_vllm_test
 
-# %%
 import os
 import time
-import openai
 import pickle
 import pprint
 import logging
 import argparse
-import numpy as np
-from openai import OpenAI
 import statistics
+import re
 from collections import Counter
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
+from vllm import LLM, SamplingParams
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def get_avg_score(scores):
-    return statistics.mean([x for x in scores if x is not None])
-
-def get_frequency(scores):
-    return dict(Counter(scores))
-
-def get_model(model_size):
-    client = clients[model_size]
-    models = client.models.list()
-    model = models.data[0].id
-    return model
-
-# %%
-model_names = {
-    "1.5b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-    "32b": "Qwen/QwQ-32B",
-}
-ports = {
-    "1.5b": "30001",
-    "32b": "30000",
-}
-clients = {}
-for size, full_name in model_names.items():
-    clients[size] = OpenAI(
-        api_key="EMPTY",
-        base_url=f"http://localhost:{ports[size]}/v1",
-    )
+# 初始化全局模型变量
+model = None
 
 def get_first_user_msg(problem, options=None):
     if options is None:
@@ -77,27 +48,27 @@ def get_first_user_msg(problem, options=None):
             ans_d=options["D"],
         )
 
-# %%
-def generate_full_reasoning(problem, model_size, options=None, max_tokens=8192):
+def generate_full_reasoning(problem, options=None, max_tokens=8192):
     """使用模型一次性生成完整的推理过程"""
-    client = clients[model_size]
+    global model
     
     start_time = time.time()  # 记录开始时间
     
-    messages = [
-        {"role": "user", "content": get_first_user_msg(problem, options)},
-    ]
+    prompt = get_first_user_msg(problem, options)
     
-    response = client.chat.completions.create(
-        model=get_model(model_size),
-        messages=messages,
-        temperature=0.6, 
-        top_p=0.95,  # https://huggingface.co/Qwen/QwQ-32B#usage-guidelines
-        max_tokens=max_tokens,
+    # 设置采样参数
+    sampling_params = SamplingParams(
+        temperature=0.6,
+        top_p=0.95,
+        max_tokens=max_tokens
     )
-
-    reasoning = response.choices[0].message.content
-    num_output_tokens = response.usage.completion_tokens
+    
+    # 生成回答
+    outputs = model.generate(prompt, sampling_params)
+    response = outputs[0]  # 获取第一个（也是唯一的）回答
+    
+    reasoning = response.outputs[0].text
+    num_output_tokens = len(response.outputs[0].token_ids)
     finished = any([x in reasoning for x in ["boxed", "Answer:", "ANSWER:"]])
     
     elapsed_time = time.time() - start_time  # 计算耗时
@@ -144,12 +115,13 @@ def run_baseline_test(args, problem_id, repeat_id):
         }
 
     # 规范输出文件路径
-    output_dir = os.path.join(args.output_dir, f"{args.model_size}", f"{args.dataset_name}")
+    model_name_short = args.model_name.split('/')[-1]  # 提取模型名称的最后部分作为目录名
+    output_dir = os.path.join(args.output_dir, f"{model_name_short}", f"{args.dataset_name}")
     os.makedirs(output_dir, exist_ok=True)
     output_filename = os.path.join(output_dir, f"{problem_id}-{repeat_id}")
     
     if os.path.exists(f"{output_filename}.pickle"):
-        logging.info(f"问题 {problem_id} 使用模型 {args.model_size} 重复 {repeat_id} 已解决，跳过")
+        logging.info(f"问题 {problem_id} 使用模型 {args.model_name} 重复 {repeat_id} 已解决，跳过")
         return
 
     start_time_total = time.time()  # 记录整个过程的开始时间
@@ -158,7 +130,6 @@ def run_baseline_test(args, problem_id, repeat_id):
         # 使用指定模型一次性生成完整的推理过程
         reasoning, finished, num_tokens, elapsed_time, token_time = generate_full_reasoning(
             problem, 
-            model_size=args.model_size, 
             options=options, 
             max_tokens=args.token_budget
         )
@@ -170,8 +141,12 @@ def run_baseline_test(args, problem_id, repeat_id):
             "num_tokens": num_tokens,
             "elapsed_time": elapsed_time,
             "token_time": token_time,  # 毫秒/token
-            "model_size": args.model_size,  # 记录使用的模型大小
+            "model_name": args.model_name,  # 记录使用的模型名称
         }
+        
+        # 从推理文本中提取最终答案
+        final_answer = extract_final_answer(reasoning, args.dataset_name)
+        metadata["final_answer"] = final_answer
         
         # 如果没有完成，记录原因
         if not finished:
@@ -179,8 +154,8 @@ def run_baseline_test(args, problem_id, repeat_id):
         else:
             metadata["stop_reason"] = "finished"
             
-    except ValueError as e:
-        logging.error(f"在聊天模板应用中捕获到ValueError: {e}，继续")
+    except Exception as e:
+        logging.error(f"在生成过程中捕获到错误: {e}，继续")
         return
 
     # 计算总时间
@@ -190,7 +165,7 @@ def run_baseline_test(args, problem_id, repeat_id):
     time_stats = {
         "total_time": total_time,
         "model_stats": {
-            "model_size": args.model_size,
+            "model_name": args.model_name,
             "total_time": elapsed_time,
             "time_percentage": (elapsed_time / total_time) * 100 if total_time > 0 else 0,
             "token_time": token_time,  # 毫秒/token
@@ -203,7 +178,7 @@ def run_baseline_test(args, problem_id, repeat_id):
     logging.info("时间统计信息:")
     logging.info(f"问题ID: {problem_id}, 重复ID: {repeat_id}")
     logging.info(f"总时间: {total_time:.2f}秒")
-    logging.info(f"模型大小: {args.model_size}")
+    logging.info(f"模型名称: {args.model_name}")
     logging.info(f"模型生成:")
     logging.info(f"  - 总时间: {elapsed_time:.2f}秒 ({(elapsed_time/total_time)*100:.2f}%)")
     logging.info(f"  - 平均token时间: {token_time:.2f}毫秒/token")
@@ -235,23 +210,100 @@ def parse_problem_range(problem_id_str):
     else:
         return [int(problem_id_str)]
 
+def extract_final_answer(reasoning, dataset_name):
+    """从推理文本中提取最终答案"""
+    if not reasoning:
+        return None
+        
+    # 使用正则表达式查找 \boxed{...} 模式的起始位置
+    match = re.search(r"\\boxed\{", reasoning)
+    if match:
+        start_pos = match.end()
+        # 使用括号计数器处理嵌套花括号
+        open_braces = 1
+        close_pos = start_pos
+        
+        for i in range(start_pos, len(reasoning)):
+            if reasoning[i] == '{':
+                open_braces += 1
+            elif reasoning[i] == '}':
+                open_braces -= 1
+                if open_braces == 0:
+                    close_pos = i
+                    break
+        
+        if open_braces == 0:
+            answer = reasoning[start_pos:close_pos].strip()
+            
+            # 对于GPQA，我们期望A、B、C或D
+            if dataset_name == "gpqa":
+                if answer in ["A", "B", "C", "D"]:
+                    return answer
+                else:
+                    # 尝试从完整答案中找到选项字母
+                    sub_match = re.match(r"([A-D])[\)\.]?", answer)
+                    if sub_match:
+                        return sub_match.group(1)
+                    logging.warning(f"无法从boxed答案中提取有效的GPQA选项: {answer}")
+                    return None
+            # 对于AIME/MATH，尝试转换为数字或直接返回
+            else:
+                try:
+                    # 首先尝试简单的整数转换
+                    return int(answer)
+                except ValueError:
+                    # 对于MATH数据集，可能包含复杂的数学表达式，直接返回
+                    if dataset_name == "math":
+                        # 规范化答案格式，移除多余空格
+                        return answer.strip()
+                    # 添加更复杂的解析（如分数等）
+                    logging.warning(f"无法将boxed答案转换为整数: {answer}")
+                    return answer  # 如果转换失败，则返回字符串
+        else:
+            logging.warning("在推理文本中找到了\\boxed{,但没有找到匹配的}，可能是格式错误")
+            return None
+    else:
+        # 备用方案：检查最后一步是否包含"Answer: X"（用于GPQA）
+        if dataset_name == "gpqa":
+            match_answer = re.search(r"[Aa]nswer:\s*([A-D])", reasoning)
+            if match_answer:
+                return match_answer.group(1).upper()
+
+        logging.warning(f"在最终步骤中找不到\\boxed{{}}模式")
+        return None
+
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description="使用单个模型运行推理")
+    parser = argparse.ArgumentParser(description="使用vllm原生接口运行推理")
     parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
                         help="数据集")
-    parser.add_argument("--token_budget", type=int, default=15900,  #8192
+    parser.add_argument("--token_budget", type=int, default=8192,
                         help="最大输出令牌数")
     # problem_id: 60-89 for AIME, 0-99 for math, 0-99 for GPQA
     parser.add_argument("--problem_id", type=str, default="60",
                         help="查询ID (AIME为60-89)，可以是单个ID或范围，例如：60-89")
     parser.add_argument("--repeat_id", type=int, default=1,
                         help="每个问题重复执行的次数")
-    parser.add_argument("--model_size", type=str, choices=["1.5b", "32b"], default="32b",
-                        help="用于推理的模型大小")
-    parser.add_argument("--output_dir", type=str, default="results/baseline_test", 
+    parser.add_argument("--model_name", type=str, default="Qwen/QwQ-32B",
+                        help="用于推理的模型名称（可在huggingface上下载）")
+    parser.add_argument("--output_dir", type=str, default="results/baseline_vllm_test", 
                         help="结果pickle文件的写入位置")
+    parser.add_argument("--tensor_parallel_size", type=int, default=4,
+                        help="张量并行大小")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8,
+                        help="GPU内存利用率")
     args, _ = parser.parse_known_args()
+    
+    # 初始化全局模型
+    global model
+    logging.info(f"正在加载模型: {args.model_name}")
+    model = LLM(
+        model=args.model_name,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+        dtype="auto"
+    )
+    logging.info(f"模型加载完成")
     
     # 解析问题ID范围
     problem_ids = parse_problem_range(args.problem_id)
@@ -273,4 +325,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,4 @@
-# python spec_scale_reason.py --dataset_name aime --problem_id 60 --repeat_id 1 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
+# python spec_scale_reason_2.py --dataset_name aime --problem_id 60 --repeat_id 1 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
 
 import os
 import time
@@ -17,28 +17,47 @@ from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
 import re
 import random
+# 导入choose-prompts模块中的选择prompt
+from prompts.choose_prompts import aime_choose_prompt, math_choose_prompt, gpqa_choose_prompt
+from prompts.aime_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def get_first_user_msg(problem, options=None, role_type=1):
-    from prompts.role_prompts import role_prompt_1, role_prompt_2, role_prompt_3
-    if role_type == 1:
-        role_prompt = role_prompt_1
-    elif role_type == 2:
-        role_prompt = role_prompt_2
-    elif role_type == 3:
-        role_prompt = role_prompt_3
-    else:
-        role_prompt = role_prompt_1
+# 新增函数: 获取方法提示
+def get_method_prompt(method_code):
+    """根据方法代码返回对应的方法提示"""
+    method_prompts = {
+        'A': A_prompt,
+        'B': B_prompt,
+        'C': C_prompt,
+        'D': D_prompt,
+        'E': E_prompt,
+        'F': F_prompt,
+        'G': G_prompt,
+        'H': H_prompt,
+        'I': I_prompt,
+        'J': J_prompt,
+        'K': K_prompt,
+        'L': L_prompt,
+        'M': M_prompt
+    }
+    return method_prompts.get(method_code, M_prompt)
+
+def get_first_user_msg(problem, options=None, method_code=None):
+    # 获取解题方法提示
+    method_prompt = get_method_prompt(method_code) if method_code else M_prompt
         
     if options is None:
         system_prompt = """
         Solve the following math problem efficiently and clearly. Please reason step by step, 
         separate logical reasoning steps with two newline characters (\n\n), and put your final answer within \\boxed{{}}.
+        
+        Tips: {method_prompt}
+        
         Problem: {problem}
         """
-        combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-        return combined_prompt.format(problem=problem)
+        return system_prompt.format(method_prompt=method_prompt, problem=problem)
     else:
         system_prompt = """
         What is the correct answer to the following problem? Please reason step by step. 
@@ -46,6 +65,8 @@ def get_first_user_msg(problem, options=None, role_type=1):
         Put the final answer **strictly** in the format \\boxed{{X}}, where X is a single letter (A, B, C, or D).
 
         **Example output:** \\boxed{{A}}
+        
+        Tips: {method_prompt}
 
         Problem: {problem}.
         Choices: 
@@ -54,8 +75,8 @@ def get_first_user_msg(problem, options=None, role_type=1):
         (C) {ans_c}
         (D) {ans_d}
         """
-        combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-        return combined_prompt.format(
+        return system_prompt.format(
+            method_prompt=method_prompt,
             problem=problem,
             ans_a=options["A"],
             ans_b=options["B"],
@@ -271,42 +292,118 @@ def prepare_problem_data(args):
         }
     return problem, options
 
+def choose_solution_methods(problem, options, dataset_name, models):
+    """选择最合适的解题方法"""
+    logging.info("选择解题方法...")
+    
+    # 选择合适的prompt
+    if dataset_name == "aime":
+        choose_prompt = aime_choose_prompt
+    elif dataset_name == "math":
+        choose_prompt = math_choose_prompt
+    elif dataset_name == "gpqa":
+        choose_prompt = gpqa_choose_prompt
+    else:
+        logging.warning(f"未知数据集: {dataset_name}，默认使用math_choose_prompt")
+        choose_prompt = math_choose_prompt
+    
+    # 准备提示
+    prompt = f"{choose_prompt}\n\nProblem: {problem}"
+    if options:
+        prompt += "\nChoices: "
+        for key, value in options.items():
+            prompt += f"\n({key}) {value}"
+    prompt = f"{prompt}\n\nExamine the problem and select the **three** strategies (by their codes, e.g. B,E,F) that you believe are most promising for solving it. You only need to output 3 codes, without any other symbols or text\n<think></think>I think the best three methods are: "
+
+    # 设置生成参数
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=5,
+    )
+    
+    # 使用目标模型生成方法选择
+    outputs = models["target"].generate([prompt], sampling_params)
+    method_text = outputs[0].outputs[0].text.strip()
+    
+    # 提取方法代码 (期望格式为三个字母，如ABC或A, B, L)
+    # 先尝试提取无分隔符的三个字母
+    methods_match = re.search(r'([A-M]{3})', method_text)
+    if methods_match:
+        methods = list(methods_match.group(1))  # 转换为字符列表
+    else:
+        # 尝试提取有分隔符的格式如"A, B, L"
+        methods_match = re.findall(r'[A-M]', method_text)
+        if len(methods_match) >= 3:
+            methods = methods_match[:3]  # 取前三个
+        else:
+            # 如果无法提取，默认使用MMM
+            logging.warning(f"无法从'{method_text}'提取方法代码，使用默认值MMM")
+            methods = ['M', 'M', 'M']
+    
+    # 确保返回3个方法，保持原始顺序
+    while len(methods) < 3:
+        methods.append('M')
+    
+    logging.info(f"选择的解题方法: {''.join(methods)}")
+    return methods  # 返回列表形式的方法代码
+
 def run_reasoning_process(args, problem, options):
     """运行推理过程"""
     start_time_total = time.time()  # 记录整个过程的开始时间
     
     try:
-        # 为每个角色创建独立的推理轨道
-        role_tracks = {
-            1: {"steps": [], "finished": False, "metadata": [], "rewrite_count": 0, "total_steps": 0},
-            2: {"steps": [], "finished": False, "metadata": [], "rewrite_count": 0, "total_steps": 0},
-            3: {"steps": [], "finished": False, "metadata": [], "rewrite_count": 0, "total_steps": 0}
-        }
+        # 使用大模型选择解题方法
+        solution_methods = choose_solution_methods(problem, options, args.dataset_name, models)
+        
+        # 为每个方法创建独立的推理轨道，使用索引区分相同方法的不同实例
+        method_tracks = {}
+        method_count = {}  # 用于跟踪每个方法出现的次数
+        
+        for i, method_code in enumerate(solution_methods):
+            # 如果是重复的方法，给它一个唯一的标识符
+            if method_code in method_count:
+                method_count[method_code] += 1
+                track_id = f"{method_code}{method_count[method_code]}"
+            else:
+                method_count[method_code] = 1
+                track_id = f"{method_code}1"
+                
+            method_tracks[track_id] = {
+                "steps": [], 
+                "finished": False, 
+                "metadata": [], 
+                "rewrite_count": 0, 
+                "total_steps": 0,
+                "method_code": method_code  # 原始方法代码，不含索引
+            }
         
         step_id = 0
         
         while True:
             # 检查是否所有轨道都已完成
-            active_roles = [role for role, track in role_tracks.items() if not track["finished"]]
-            if not active_roles:
+            active_methods = [method for method, track in method_tracks.items() if not track["finished"]]
+            if not active_methods:
                 break
                 
-            logging.info(f"[Step {step_id}] 活跃角色: {active_roles}")
+            logging.info(f"[Step {step_id}] 活跃方法: {active_methods}")
             
-            # 1. 为每个活跃角色并行生成下一步推理
+            # 1. 为每个活跃方法并行生成下一步推理
             active_prompts = []
-            role_mapping = []  # 用于跟踪每个提示对应的角色
+            method_mapping = []  # 用于跟踪每个提示对应的方法
             
-            for role in active_roles:
-                track = role_tracks[role]
+            for method in active_methods:
+                track = method_tracks[method]
+                # 获取原始方法代码（不含索引）
+                original_method_code = track["method_code"]
+                
                 if not track["steps"]:  # 第一步
-                    prompt = get_first_user_msg(problem, options, role_type=role)
+                    prompt = get_first_user_msg(problem, options, method_code=original_method_code)
                 else:  # 继续之前的消息
                     steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
-                    prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}"
+                    prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
                 
                 active_prompts.append(prompt)
-                role_mapping.append(role)
+                method_mapping.append(method)
             
             # 设置采样参数
             sampling_params = SamplingParams(
@@ -321,11 +418,11 @@ def run_reasoning_process(args, problem, options):
             
             # 2. 处理小模型输出并准备评分
             score_prompts = []
-            score_role_mapping = []
+            score_method_mapping = []
             small_results = {}
             
             for i, output in enumerate(small_outputs):
-                role = role_mapping[i]
+                method = method_mapping[i]
                 generated_text = output.outputs[0].text
                 num_tokens = len(output.outputs[0].token_ids)
                 
@@ -333,21 +430,21 @@ def run_reasoning_process(args, problem, options):
                 finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
                 
                 # 存储小模型结果
-                small_results[role] = {
+                small_results[method] = {
                     "text": generated_text,
                     "tokens": num_tokens,
                     "finished": finished
                 }
                 
                 # 准备评分提示
-                track = role_tracks[role]
+                track = method_tracks[method]
                 steps_for_scoring = track["steps"] + [generated_text]
                 steps_so_far_str = "\n\n".join(steps_for_scoring) + "\n\n"
                 
-                score_prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
+                score_prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
                 
                 score_prompts.append(score_prompt)
-                score_role_mapping.append(role)
+                score_method_mapping.append(method)
             
             # 3. 批量评分
             scoring_params = SamplingParams(
@@ -360,32 +457,32 @@ def run_reasoning_process(args, problem, options):
             
             # 4. 处理评分结果，确定哪些需要重写
             rewrite_prompts = []
-            rewrite_role_mapping = []
+            rewrite_method_mapping = []
             scores = {}
             
             for i, output in enumerate(score_outputs):
-                role = score_role_mapping[i]
+                method = score_method_mapping[i]
                 token = output.outputs[0].text
                 logprobs = output.outputs[0].logprobs[0]
                 
                 score = process_vllm_logprobs(token, logprobs, method=args.score_method)
-                scores[role] = score
+                scores[method] = score
                 
                 # 如果分数低于阈值，需要重写
                 if score is None or score < args.score_threshold:
-                    logging.info(f"[Step {step_id}] 角色 {role} 分数 {score}，需要重写")
-                    track = role_tracks[role]
+                    logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，需要重写")
+                    track = method_tracks[method]
                     
                     if not track["steps"]:  # 第一步
-                        prompt = get_first_user_msg(problem, options, role_type=role)
+                        prompt = get_first_user_msg(problem, options, method_code=original_method_code)
                     else:  # 继续之前的消息
                         steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
-                        prompt = f"{get_first_user_msg(problem, options, role_type=role)}\n<think>{steps_so_far_str}"
+                        prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
                     
                     rewrite_prompts.append(prompt)
-                    rewrite_role_mapping.append(role)
+                    rewrite_method_mapping.append(method)
                 else:
-                    logging.info(f"[Step {step_id}] 角色 {role} 分数 {score}，已接受")
+                    logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，已接受")
             
             # 5. 如果有需要重写的，批量重写
             rewrite_results = {}
@@ -393,37 +490,37 @@ def run_reasoning_process(args, problem, options):
                 rewrite_outputs = models["target"].generate(rewrite_prompts, sampling_params)
                 
                 for i, output in enumerate(rewrite_outputs):
-                    role = rewrite_role_mapping[i]
+                    method = rewrite_method_mapping[i]
                     generated_text = output.outputs[0].text
                     num_tokens = len(output.outputs[0].token_ids)
                     
                     # 检查是否完成
                     finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
                     
-                    rewrite_results[role] = {
+                    rewrite_results[method] = {
                         "text": generated_text,
                         "tokens": num_tokens,
                         "finished": finished
                     }
             
-            # 6. 更新每个角色的轨道
-            for role in active_roles:
-                track = role_tracks[role]
+            # 6. 更新每个方法的轨道
+            for method in active_methods:
+                track = method_tracks[method]
                 
                 # 确定最终使用的步骤
-                if role in rewrite_results:
+                if method in rewrite_results:
                     # 使用重写的结果
-                    step_text = rewrite_results[role]["text"]
-                    num_tokens = rewrite_results[role]["tokens"]
-                    finished = rewrite_results[role]["finished"]
+                    step_text = rewrite_results[method]["text"]
+                    num_tokens = rewrite_results[method]["tokens"]
+                    finished = rewrite_results[method]["finished"]
                     used_base_model = True
                     # 增加改写计数
                     track["rewrite_count"] += 1
                 else:
                     # 使用小模型的结果
-                    step_text = small_results[role]["text"]
-                    num_tokens = small_results[role]["tokens"]
-                    finished = small_results[role]["finished"]
+                    step_text = small_results[method]["text"]
+                    num_tokens = small_results[method]["tokens"]
+                    finished = small_results[method]["finished"]
                     used_base_model = False
                 
                 # 增加总步骤计数
@@ -431,7 +528,7 @@ def run_reasoning_process(args, problem, options):
                 
                 # 处理特殊情况
                 if "</think>" in step_text and not any([x in step_text for x in ["boxed", "Answer:", "ANSWER:"]]):
-                    logging.warning(f"Warning: 角色 {role} 的步骤包含 </think>，正在移除")
+                    logging.warning(f"Warning: 方法 {method} 的步骤包含 </think>，正在移除")
                     step_text = step_text.replace("</think>", "")
                     warning_flag = True
                 else:
@@ -443,13 +540,13 @@ def run_reasoning_process(args, problem, options):
                 # 创建元数据
                 metadata = {
                     "step_id": step_id,
-                    "role_type": role,
+                    "method_code": original_method_code,
                     "step_str": step_text,
-                    "small_model_step": small_results[role]["text"],
-                    "num_output_tokens_small": small_results[role]["tokens"],
-                    "score": scores[role],
-                    "base_model_step": rewrite_results.get(role, {}).get("text") if used_base_model else None,
-                    "num_output_tokens_base": rewrite_results.get(role, {}).get("tokens") if used_base_model else None,
+                    "small_model_step": small_results[method]["text"],
+                    "num_output_tokens_small": small_results[method]["tokens"],
+                    "score": scores[method],
+                    "base_model_step": rewrite_results.get(method, {}).get("text") if used_base_model else None,
+                    "num_output_tokens_base": rewrite_results.get(method, {}).get("tokens") if used_base_model else None,
                     "final_num_output_tokens": num_tokens,
                     "used_base_model": used_base_model
                 }
@@ -479,46 +576,50 @@ def run_reasoning_process(args, problem, options):
         # 计算改写率
         rewrite_rates = {}
         total_rewrite_rate = 0.0
-        valid_roles = 0
+        valid_methods = 0
         
-        for role, track in role_tracks.items():
+        for method, track in method_tracks.items():
             if track["total_steps"] > 0:
                 rewrite_rate = track["rewrite_count"] / track["total_steps"] * 100
                 track["rewrite_rate"] = rewrite_rate
                 total_rewrite_rate += rewrite_rate
-                valid_roles += 1
-                logging.info(f"角色 {role} 改写率: {rewrite_rate:.2f}% ({track['rewrite_count']}/{track['total_steps']})")
+                valid_methods += 1
+                logging.info(f"方法 {method} 改写率: {rewrite_rate:.2f}% ({track['rewrite_count']}/{track['total_steps']})")
         
         # 计算平均改写率
-        avg_rewrite_rate = total_rewrite_rate / valid_roles if valid_roles > 0 else 0
+        avg_rewrite_rate = total_rewrite_rate / valid_methods if valid_methods > 0 else 0
         logging.info(f"平均改写率: {avg_rewrite_rate:.2f}%")
 
     except ValueError as e:
         logging.error(f"ValueError caught in chat template application: {e}")
+        method_tracks = {}
+        total_time = 0
+        avg_rewrite_rate = 0
          
-    return role_tracks, total_time, avg_rewrite_rate
+    return method_tracks, total_time, avg_rewrite_rate
 
-def process_results(role_tracks, total_time, avg_rewrite_rate, args, problem, options):
+def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options):
     """处理结果并保存"""
-    # 合并所有角色的元数据
+    # 合并所有方法的元数据
     all_metadata = []
-    for role, track in role_tracks.items():
+    for method, track in method_tracks.items():
         for metadata in track["metadata"]:
             all_metadata.append(metadata)
 
-    # 为每个角色选择最终结果
+    # 为每个方法选择最终结果
     final_results = {}
-    for role, track in role_tracks.items():
+    for method, track in method_tracks.items():
         if track["finished"]:
             # 提取答案
             answer = extract_final_answer("\n\n".join(track["steps"]), args.dataset_name)
             
-            final_results[role] = {
+            final_results[method] = {
                 "steps": track["steps"],
                 "answer": answer,
                 "stop_reason": track.get("stop_reason", "unknown"),
                 "num_tokens": sum([m["final_num_output_tokens"] for m in track["metadata"]]),
-                "num_steps": len(track["steps"])
+                "num_steps": len(track["steps"]),
+                "method_code": track["method_code"]  # 记录使用的方法代码
             }
 
     # 选择最佳结果
@@ -531,14 +632,15 @@ def process_results(role_tracks, total_time, avg_rewrite_rate, args, problem, op
         "dataset_name": args.dataset_name,
         "problem": problem,
         "options": options,
-        "role_tracks": role_tracks,
+        "solution_methods": list(method_tracks.keys()),  # 记录使用的解题方法
+        "method_tracks": method_tracks,
         "final_results": final_results,
         "best_result": best_result,
         "total_time": total_time,
         "score_threshold": args.score_threshold,
         "token_budget": args.token_budget,
         "score_method": args.score_method,
-        "avg_rewrite_rate":avg_rewrite_rate
+        "avg_rewrite_rate": avg_rewrite_rate
     }
     
     return metadata_with_stats
@@ -596,10 +698,10 @@ def main():
             problem, options = prepare_problem_data(args)
             
             # 运行推理过程
-            role_tracks, total_time, avg_rewrite_rate = run_reasoning_process(args, problem, options)
+            method_tracks, total_time, avg_rewrite_rate = run_reasoning_process(args, problem, options)
             
             # 处理结果
-            metadata_with_stats = process_results(role_tracks, total_time, avg_rewrite_rate, args, problem, options)
+            metadata_with_stats = process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options)
             
             # 保存结果
             save_results(metadata_with_stats, output_filename)

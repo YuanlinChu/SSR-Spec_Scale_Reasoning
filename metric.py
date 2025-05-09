@@ -37,8 +37,8 @@ def pass_at_k(N: int, temp_to_scores: Dict[str, Dict[str, Any]]):
             final_passk_scores[f"{k=}"] = round(np.mean(k_to_passk_scores[k]) * 100, 3)
 
         # print("Final pass @ k:")
-        for k, s in final_passk_scores.items():
-            logging.info(f"temp: {temp}, k: {k}, pass @ k: {s}")
+        # for k, s in final_passk_scores.items():
+        #     logging.info(f"temp: {temp}, k: {k}, pass @ k: {s}")
         pass_values[f"{temp=}"] = final_passk_scores
         # temp_correct = sum([any(x) for x in scores])
     return pass_values

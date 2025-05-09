@@ -1,4 +1,4 @@
-# python pre_exp.py --dataset_name aime --problem_id 60 --repeat_id 1 --model_size 32b --token_budget 8192
+#python base_reason_test.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_size 32b --output_dir results/baseline_test
 
 # %%
 import os
@@ -9,14 +9,12 @@ import pprint
 import logging
 import argparse
 import numpy as np
-import re
 from openai import OpenAI
 import statistics
 from collections import Counter
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
-from prompts.role_prompts import role_prompt_1, role_prompt_2, role_prompt_3
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -35,11 +33,13 @@ def get_model(model_size):
 # %%
 model_names = {
     "1.5b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    # "Llama8b": "meta-llama/Llama-3.1-8B",
     "32b": "Qwen/QwQ-32B",
 }
 ports = {
     "1.5b": "30001",
     "32b": "30000",
+    # "Llama8b": "30002",
 }
 clients = {}
 for size, full_name in model_names.items():
@@ -48,27 +48,14 @@ for size, full_name in model_names.items():
         base_url=f"http://localhost:{ports[size]}/v1",
     )
 
-def get_first_user_msg(problem, options=None, role_type=None):
-    # 根据role_type选择不同的角色提示
-    role_prompt = None
-    if role_type == 1:
-        role_prompt = role_prompt_1
-    elif role_type == 2:
-        role_prompt = role_prompt_2
-    elif role_type == 3:
-        role_prompt = role_prompt_3
-    
+def get_first_user_msg(problem, options=None):
     if options is None:
         system_prompt = """
         Solve the following math problem efficiently and clearly. Please reason step by step, 
         separate logical reasoning steps with two newline characters (\n\n), and put your final answer within \\boxed{{}}.
         Problem: {problem}
         """
-        if role_prompt:
-            combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-            return combined_prompt.format(problem=problem)
-        else:
-            return system_prompt.format(problem=problem)
+        return system_prompt.format(problem=problem)
     else:
         system_prompt = """
         What is the correct answer to the following problem? Please reason step by step. 
@@ -84,33 +71,23 @@ def get_first_user_msg(problem, options=None, role_type=None):
         (C) {ans_c}
         (D) {ans_d}
         """
-        if role_prompt:
-            combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-            return combined_prompt.format(
-                problem=problem,
-                ans_a=options["A"],
-                ans_b=options["B"],
-                ans_c=options["C"],
-                ans_d=options["D"],
-            )
-        else:
-            return system_prompt.format(
-                problem=problem,
-                ans_a=options["A"],
-                ans_b=options["B"],
-                ans_c=options["C"],
-                ans_d=options["D"],
-            )
+        return system_prompt.format(
+            problem=problem,
+            ans_a=options["A"],
+            ans_b=options["B"],
+            ans_c=options["C"],
+            ans_d=options["D"],
+        )
 
 # %%
-def generate_full_reasoning(problem, model_size, options=None, max_tokens=8192, role_type=None):
+def generate_full_reasoning(problem, model_size, options=None, max_tokens=8192):
     """使用模型一次性生成完整的推理过程"""
     client = clients[model_size]
     
     start_time = time.time()  # 记录开始时间
     
     messages = [
-        {"role": "user", "content": get_first_user_msg(problem, options, role_type)},
+        {"role": "user", "content": get_first_user_msg(problem, options)},
     ]
     
     response = client.chat.completions.create(
@@ -131,23 +108,6 @@ def generate_full_reasoning(problem, model_size, options=None, max_tokens=8192, 
     time_per_token = (elapsed_time * 1000) / num_output_tokens if num_output_tokens > 0 else 0
     
     return reasoning, finished, num_output_tokens, elapsed_time, time_per_token
-
-def extract_answer(reasoning):
-    """从推理文本中提取最终答案"""
-    if not reasoning:
-        return None
-        
-    # 使用正则表达式查找 \boxed{answer} 模式
-    match = re.search(r"\\boxed\{(.+?)\}", reasoning)
-    if match:
-        answer = match.group(1).strip()
-        return answer
-    else:
-        # 备用方案：检查最后一步是否包含"Answer: X"
-        match_answer = re.search(r"[Aa]nswer:\s*([A-Za-z0-9]+)", reasoning)
-        if match_answer:
-            return match_answer.group(1).upper()
-        return None
 
 def get_dataset(dataset_name):
     if dataset_name == "aime":
@@ -197,44 +157,30 @@ def run_baseline_test(args, problem_id, repeat_id):
     start_time_total = time.time()  # 记录整个过程的开始时间
 
     try:
-        # 使用三种不同的role-prompt生成推理过程
-        results = []
-        for role_type in [1, 2, 3]:
-            logging.info(f"使用角色类型 {role_type} 生成推理...")
-            reasoning, finished, num_tokens, elapsed_time, token_time = generate_full_reasoning(
-                problem, 
-                model_size=args.model_size, 
-                options=options, 
-                max_tokens=args.token_budget,
-                role_type=role_type
-            )
-            
-            # 记录结果
-            result = {
-                "reasoning": reasoning,
-                "finished": finished,
-                "num_tokens": num_tokens,
-                "elapsed_time": elapsed_time,
-                "token_time": token_time,  # 毫秒/token
-                "model_size": args.model_size,  # 记录使用的模型大小
-                "role_type": role_type,  # 记录使用的角色类型
-            }
-            
-            # 如果没有完成，记录原因
-            if not finished:
-                result["stop_reason"] = "budget"
-            else:
-                result["stop_reason"] = "finished"
-                
-            # 提取答案
-            if result["stop_reason"] == "finished":
-                result["answer"] = extract_answer(reasoning)
-            
-            results.append(result)
+        # 使用指定模型一次性生成完整的推理过程
+        reasoning, finished, num_tokens, elapsed_time, token_time = generate_full_reasoning(
+            problem, 
+            model_size=args.model_size, 
+            options=options, 
+            max_tokens=args.token_budget
+        )
         
-        # 选择最终答案
-        final_result = select_best_result(results)
+        # 记录结果
+        metadata = {
+            "reasoning": reasoning,
+            "finished": finished,
+            "num_tokens": num_tokens,
+            "elapsed_time": elapsed_time,
+            "token_time": token_time,  # 毫秒/token
+            "model_size": args.model_size,  # 记录使用的模型大小
+        }
         
+        # 如果没有完成，记录原因
+        if not finished:
+            metadata["stop_reason"] = "budget"
+        else:
+            metadata["stop_reason"] = "finished"
+            
     except ValueError as e:
         logging.error(f"在聊天模板应用中捕获到ValueError: {e}，继续")
         return
@@ -247,14 +193,11 @@ def run_baseline_test(args, problem_id, repeat_id):
         "total_time": total_time,
         "model_stats": {
             "model_size": args.model_size,
-            "total_time": sum(r["elapsed_time"] for r in results),
-            "time_percentage": (sum(r["elapsed_time"] for r in results) / total_time) * 100 if total_time > 0 else 0,
-            "token_time": statistics.mean([r["token_time"] for r in results]),  # 毫秒/token
+            "total_time": elapsed_time,
+            "time_percentage": (elapsed_time / total_time) * 100 if total_time > 0 else 0,
+            "token_time": token_time,  # 毫秒/token
         },
-        "total_tokens": sum(r["num_tokens"] for r in results),
-        "role_results": results,
-        "selected_role": final_result.get("role_type") if final_result else None,
-        "selection_reason": final_result.get("selection_reason") if final_result else "所有推理都失败"
+        "total_tokens": num_tokens
     }
 
     # 打印时间统计信息
@@ -264,28 +207,19 @@ def run_baseline_test(args, problem_id, repeat_id):
     logging.info(f"总时间: {total_time:.2f}秒")
     logging.info(f"模型大小: {args.model_size}")
     logging.info(f"模型生成:")
-    for i, result in enumerate(results, 1):
-        logging.info(f"  角色 {result['role_type']}:")
-        logging.info(f"    - 总时间: {result['elapsed_time']:.2f}秒")
-        logging.info(f"    - 平均token时间: {result['token_time']:.2f}毫秒/token")
-        logging.info(f"    - 总token数: {result['num_tokens']}")
-        logging.info(f"    - 是否完成: {result['finished']}")
-        logging.info(f"    - 停止原因: {result.get('stop_reason', '未知')}")
-        if result.get("answer"):
-            logging.info(f"    - 答案: {result['answer']}")
-    
-    if final_result:
-        logging.info(f"选择的角色: {final_result['role_type']}")
-        logging.info(f"选择原因: {final_result['selection_reason']}")
-        logging.info(f"最终答案: {final_result.get('answer', '无法提取')}")
+    logging.info(f"  - 总时间: {elapsed_time:.2f}秒 ({(elapsed_time/total_time)*100:.2f}%)")
+    logging.info(f"  - 平均token时间: {token_time:.2f}毫秒/token")
+    logging.info(f"  - 总token数: {num_tokens}")
+    logging.info(f"  - 是否完成: {finished}")
+    if not finished:
+        logging.info(f"  - 停止原因: 达到token预算上限")
     else:
-        logging.info("无法选择有效结果: 所有推理都失败")
-    
+        logging.info(f"  - 停止原因: 推理完成")
     logging.info("=" * 50)
 
     # 将时间统计信息添加到元数据
     metadata_with_stats = {
-        "reasoning": final_result if final_result else {"reasoning": "所有推理都失败", "stop_reason": "budget"},
+        "reasoning": metadata,
         "time_stats": time_stats
     }
 
@@ -294,35 +228,6 @@ def run_baseline_test(args, problem_id, repeat_id):
 
     with open(f"{output_filename}.txt", "w") as f:
         pprint.pprint(metadata_with_stats, stream=f)
-
-def select_best_result(results):
-    """根据指定规则选择最佳结果"""
-    # 过滤出成功完成的结果
-    finished_results = [r for r in results if r.get("stop_reason") == "finished" and r.get("answer") is not None]
-    
-    if not finished_results:
-        logging.warning("所有推理都未能完成或提取答案")
-        return None
-    
-    # 统计答案
-    answers = [r.get("answer") for r in finished_results]
-    answer_counts = Counter(answers)
-    
-    # 如果有答案相同的，取多数
-    if len(answer_counts) < len(finished_results):
-        most_common_answer, count = answer_counts.most_common(1)[0]
-        if count > 1:  # 确保至少有两个相同答案
-            # 找出具有最常见答案的所有结果
-            selected_results = [r for r in finished_results if r.get("answer") == most_common_answer]
-            # 从中选择token数最多的
-            selected_result = max(selected_results, key=lambda r: r.get("num_tokens", 0))
-            selected_result["selection_reason"] = f"多数原则: {count}/{len(finished_results)}个结果给出相同答案"
-            return selected_result
-    
-    # 如果答案各不相同，取token数最多的
-    selected_result = max(finished_results, key=lambda r: r.get("num_tokens", 0))
-    selected_result["selection_reason"] = "答案各不相同，选择token数最多的结果"
-    return selected_result
 
 def parse_problem_range(problem_id_str):
     """解析问题ID范围，支持单个ID或范围（如60-89）"""
@@ -337,16 +242,16 @@ def main():
     parser = argparse.ArgumentParser(description="使用单个模型运行推理")
     parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
                         help="数据集")
-    parser.add_argument("--token_budget", type=int, default=8192,
+    parser.add_argument("--token_budget", type=int, default=15900,  #8192
                         help="最大输出令牌数")
     # problem_id: 60-89 for AIME, 0-99 for math, 0-99 for GPQA
     parser.add_argument("--problem_id", type=str, default="60",
                         help="查询ID (AIME为60-89)，可以是单个ID或范围，例如：60-89")
     parser.add_argument("--repeat_id", type=int, default=1,
                         help="每个问题重复执行的次数")
-    parser.add_argument("--model_size", type=str, choices=["1.5b", "32b"], default="32b",
+    parser.add_argument("--model_size", type=str, choices=["1.5b", "32b", "Llama8b"], default="32b",
                         help="用于推理的模型大小")
-    parser.add_argument("--output_dir", type=str, default="results/scale_test", 
+    parser.add_argument("--output_dir", type=str, default="results/baseline_test", 
                         help="结果pickle文件的写入位置")
     args, _ = parser.parse_known_args()
     
@@ -370,3 +275,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

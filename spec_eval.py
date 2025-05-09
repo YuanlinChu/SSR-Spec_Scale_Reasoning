@@ -1,4 +1,7 @@
-#python baseline_eval.py --dataset_name aime --model_name DeepSeek-R1-Distill-Qwen-14B --results_dir results/baseline_vllm_test
+# python spec_eval.py --dataset_name aime --model_size 32b --results_dir results/spec_scale_9
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 import os
 import re
@@ -8,8 +11,70 @@ import logging
 import numpy as np
 from collections import defaultdict
 from datasets import load_dataset, load_from_disk
+from metric import pass_at_k
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# def get_ground_truth(dataset, problem_idx, dataset_name):
+#     """
+#     从数据集中获取正确答案
+#     """
+#     if dataset_name == "aime":
+#         try:
+#             # 根据观察到的数据集结构，直接使用 answer 字段
+#             answer_str = dataset[problem_idx].get("answer", "")
+#             try:
+#                 # 尝试直接转换为整数
+#                 return int(answer_str)
+#             except ValueError:
+#                 # 如果直接转换失败，尝试使用正则表达式提取数字
+#                 match = re.search(r"(\d+)$", answer_str)
+#                 if match:
+#                     return int(match.group(1))
+#                 logging.error(f"无法从AIME索引{problem_idx}的答案中提取数字: {answer_str}")
+#                 return None
+#         except (ValueError, TypeError, KeyError) as e:
+#             logging.error(f"获取AIME索引{problem_idx}的正确答案时出错: {e}. 答案字符串: {dataset[problem_idx].get('answer', 'N/A')}")
+#             return None
+#     elif dataset_name == "math":
+#         try:
+#             solution_str = dataset[problem_idx].get("solution", "")
+#             match = re.search(r"\\boxed\{(.+?)\}", solution_str)
+#             if match:
+#                 answer = match.group(1).strip()
+#                 try:
+#                     # 首先尝试转换为整数
+#                     return int(answer)
+#                 except ValueError:
+#                     # 处理分数或其他格式
+#                     logging.warning(f"MATH正确答案不是简单整数: {answer}")
+#                     return answer  # 如果不是整数，则返回字符串
+#             else:
+#                 logging.error(f"无法从MATH索引{problem_idx}的解决方案中提取正确答案: {solution_str}")
+#                 return None
+#         except (KeyError, TypeError) as e:
+#             logging.error(f"访问MATH索引{problem_idx}的解决方案时出错: {e}")
+#             return None
+#     elif dataset_name == "gpqa":
+#         try:
+#             # 找到与正确答案文本对应的字母
+#             correct_answer_text = dataset[problem_idx].get("Correct Answer")
+#             options_text = {
+#                 "A": dataset[problem_idx].get("Answer A"),
+#                 "B": dataset[problem_idx].get("Answer B"),
+#                 "C": dataset[problem_idx].get("Answer C"),
+#                 "D": dataset[problem_idx].get("Answer D"),
+#             }
+#             for letter, text in options_text.items():
+#                 if text == correct_answer_text:
+#                     return letter
+#             logging.error(f"无法为GPQA索引{problem_idx}找到匹配的正确答案字母")
+#             return None
+#         except (KeyError, TypeError) as e:
+#             logging.error(f"获取GPQA索引{problem_idx}的正确答案时出错: {e}")
+#             return None
+#     else:
+#         raise ValueError(f"未知的数据集名称: {dataset_name}")
 
 def get_ground_truth(dataset, problem_idx, dataset_name):
     """
@@ -64,6 +129,28 @@ def get_ground_truth(dataset, problem_idx, dataset_name):
             return None
     else:
         raise ValueError(f"未知的数据集名称: {dataset_name}")
+
+# def compare_answers(model_answer, ground_truth, dataset_name):
+#     """
+#     比较模型答案与正确答案
+#     """
+#     if model_answer is None or ground_truth is None:
+#         return False
+        
+#     # 规范化答案进行比较（例如，转换为相同类型）
+#     try:
+#         if dataset_name in ["aime", "math"]:
+#             # 尝试数值比较
+#             return int(model_answer) == int(ground_truth)
+#         elif dataset_name == "gpqa":
+#             # 简单的字符串比较A、B、C、D
+#             return str(model_answer).upper() == str(ground_truth).upper()
+#         else:
+#             return str(model_answer) == str(ground_truth)
+#     except (ValueError, TypeError):
+#         # 如果数值转换失败，则回退到字符串比较
+#         logging.warning(f"{dataset_name}的数值比较失败。以字符串形式比较: '{model_answer}' vs '{ground_truth}'")
+#         return str(model_answer).strip() == str(ground_truth).strip()
 
 def compare_answers(model_answer, ground_truth, dataset_name):
     """
@@ -183,19 +270,16 @@ def evaluate_model(args):
         logging.error(f"加载数据集'{args.dataset_name}'失败: {e}")
         return
 
-    model_dir = os.path.join(args.results_dir, args.model_name, args.dataset_name)
+    # 检查结果目录是否存在
+    model_dir = os.path.join(args.results_dir, args.dataset_name)
     if not os.path.isdir(model_dir):
         logging.error(f"结果目录未找到: {model_dir}")
         return
 
     # 初始化统计数据
     problem_stats = {}  # 每个问题的统计信息
-    total_correct = 0   # 所有正确的次数
-    total_attempts = 0  # 所有尝试的次数
-    problems_with_correct = 0  # 至少有一次正确的问题数
     problem_to_scores = defaultdict(list)  # 每个问题的正确/错误列表
-    budget_exceeded_count = 0  # 超出字数限制的次数
-
+    
     # 遍历结果文件
     for filename in os.listdir(model_dir):
         if not filename.endswith(".pickle"):
@@ -222,27 +306,30 @@ def evaluate_model(args):
             with open(file_path, "rb") as f:
                 data = pickle.load(f)
                 
-            # 提取模型的推理结果
-            reasoning_data = data["reasoning"]
-            reasoning = reasoning_data.get("reasoning", "")
-            model_answer = reasoning_data.get("answer") or reasoning_data.get("final_answer")
+            # 从best_result中直接获取答案，这是与eval.py的主要区别
+            best_result = data.get("best_result", {})
             
-            # 如果model_answer不存在，直接判定为错误
-            if model_answer is None:
+            # 检查是否有答案
+            if best_result is None or best_result.get("answer") is None:
                 is_correct = False
+                logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 没有找到答案，可能是由于达到token预算上限")
             else:
-                # 获取正确答案
+                # 直接从best_result中获取答案
+                model_answer = best_result.get("answer")
                 ground_truth = get_ground_truth(dataset, problem_idx, args.dataset_name)
-                is_correct = compare_answers(model_answer, ground_truth, args.dataset_name)
-            
-            # 记录详细结果
-            if is_correct:
-                pass
-                # logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 模型='{model_answer}'，正确答案='{ground_truth}'，判断={is_correct}")
-            else:
-                stop_reason = reasoning_data.get("stop_reason")
-                logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 模型='{model_answer}'，正确答案='{ground_truth}'，判断={is_correct}，停止原因={stop_reason}")
                 
+                # # 检查答案是否正确
+                is_correct = compare_answers(model_answer, ground_truth, args.dataset_name)
+                # logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 模型='{model_answer}'，正确答案='{ground_truth}'，正确={is_correct}")
+            
+                # 记录详细结果
+                if is_correct:
+                    pass
+                    # logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 模型='{model_answer}'，正确答案='{ground_truth}'，判断={is_correct}")
+                else:
+                    logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id}: 模型='{model_answer}'，正确答案='{ground_truth}'，判断={is_correct}")
+               
+
             # 更新问题统计信息
             if problem_id not in problem_stats:
                 problem_stats[problem_id] = {"attempts": 0, "correct": 0}
@@ -250,27 +337,20 @@ def evaluate_model(args):
             problem_stats[problem_id]["attempts"] += 1
             if is_correct:
                 problem_stats[problem_id]["correct"] += 1
-                total_correct += 1
                 
-            total_attempts += 1
-            
-            # 检查是否超出字数限制
-            if reasoning_data.get("stop_reason") == "budget":
-                budget_exceeded_count += 1
-            
             # 为pass@k计算添加结果
             problem_to_scores[problem_id].append(is_correct)
                 
         except Exception as e:
             logging.error(f"处理文件 {file_path} 时出错: {e}")
 
-    # 计算每个问题是否至少有一次正确
-    for problem_id, stats in problem_stats.items():
-        if stats["correct"] > 0:
-            problems_with_correct += 1
+    # 计算基本统计信息
+    total_problems = len(problem_stats)
+    total_attempts = sum(stats["attempts"] for stats in problem_stats.values())
+    total_correct = sum(stats["correct"] for stats in problem_stats.values())
+    problems_with_correct = sum(1 for stats in problem_stats.values() if stats["correct"] > 0)
 
     # 计算准确率
-    total_problems = len(problem_stats)
     if total_problems > 0:
         accuracy_method1 = (problems_with_correct / total_problems) * 100
     else:
@@ -281,19 +361,18 @@ def evaluate_model(args):
     else:
         accuracy_method2 = 0
 
-    # 打印结果
+    # 打印基本结果
     logging.info("=" * 50)
     logging.info("评估摘要:")
     logging.info(f"数据集: {args.dataset_name}")
-    logging.info(f"模型: {args.model_name}")
+    logging.info(f"模型: {args.model_size}")
     logging.info(f"结果目录: {model_dir}")
     logging.info(f"总问题数: {total_problems}")
     logging.info(f"总尝试次数: {total_attempts}")
     logging.info(f"总正确次数: {total_correct}")
-    logging.info(f"超出字数限制的次数: {budget_exceeded_count} ({(budget_exceeded_count/total_attempts)*100:.2f}%)")
     logging.info(f"至少有一次正确的问题数: {problems_with_correct}")
-    logging.info(f"(至少一次正确的问题/总问题数): {accuracy_method1:.2f}%")
-    logging.info(f"(总正确次数/总尝试次数): {accuracy_method2:.2f}%")
+    logging.info(f"方法1准确率 (至少一次正确的问题/总问题数): {accuracy_method1:.2f}%")
+    logging.info(f"方法2准确率 (总正确次数/总尝试次数): {accuracy_method2:.2f}%")
     logging.info("=" * 50)
     
     # 打印每个问题的详细统计信息
@@ -303,68 +382,50 @@ def evaluate_model(args):
         logging.info(f"问题 {problem_id}: 尝试={stats['attempts']}, 正确={stats['correct']}, 正确率={stats['correct']/stats['attempts']*100:.2f}%")
     
     # 计算pass@k
-    try:
-        from metric import pass_at_k
-        
-        # 准备pass@k的输入数据
-        N = max(len(scores) for scores in problem_to_scores.values())
-        temp_to_scores = {"default": {}}
-        
-        # 确保每个问题都有相同数量的尝试
-        for problem_id, scores in problem_to_scores.items():
-            # 如果某个问题的尝试次数少于N，用False填充
-            while len(scores) < N:
-                scores.append(False)
-            temp_to_scores["default"][problem_id] = scores
-        
-        # 计算pass@k
-        pass_k_results = pass_at_k(N, temp_to_scores)
-        
-        # 打印pass@k结果
-        logging.info("=" * 50)
-        logging.info("Pass@k 结果:")
-        for temp, results in pass_k_results.items():
-            logging.info(f"温度: {temp}")
-            for k, value in results.items():
-                logging.info(f"  {k}: {value}%")
-        logging.info("=" * 50)
-        
-        return {
-            "total_problems": total_problems,
-            "total_attempts": total_attempts,
-            "total_correct": total_correct,
-            "problems_with_correct": problems_with_correct,
-            "accuracy_method1": accuracy_method1,
-            "accuracy_method2": accuracy_method2,
-            "problem_stats": problem_stats,
-            "pass_at_k": pass_k_results
-        }
-    except ImportError:
-        logging.warning("未找到metric模块，跳过pass@k计算")
-        
-        return {
-            "total_problems": total_problems,
-            "total_attempts": total_attempts,
-            "total_correct": total_correct,
-            "problems_with_correct": problems_with_correct,
-            "accuracy_method1": accuracy_method1,
-            "accuracy_method2": accuracy_method2,
-            "problem_stats": problem_stats
-        }
+    # 准备pass@k的输入数据
+    N = max(len(scores) for scores in problem_to_scores.values())
+    temp_to_scores = {"default": {}}
+    
+    # 确保每个问题都有相同数量的尝试
+    for problem_id, scores in problem_to_scores.items():
+        # 如果某个问题的尝试次数少于N，用False填充
+        while len(scores) < N:
+            scores.append(False)
+        temp_to_scores["default"][problem_id] = scores
+    
+    # 计算pass@k
+    pass_k_results = pass_at_k(N, temp_to_scores)
+    
+    # 打印pass@k结果
+    logging.info("=" * 50)
+    logging.info("Pass@k 结果:")
+    for temp, results in pass_k_results.items():
+        logging.info(f"温度: {temp}")
+        for k, value in results.items():
+            logging.info(f"  {k}: {value}%")
+    logging.info("=" * 50)
+    
+    return {
+        "total_problems": total_problems,
+        "total_attempts": total_attempts,
+        "total_correct": total_correct,
+        "problems_with_correct": problems_with_correct,
+        "accuracy_method1": accuracy_method1,
+        "accuracy_method2": accuracy_method2,
+        "problem_stats": problem_stats,
+        "pass_at_k": pass_k_results
+    }
 
 def main():
-    parser = argparse.ArgumentParser(description="评估基线模型在数据集上的表现")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], required=True,
-                        help="要评估的数据集")
-    parser.add_argument("--model_name", type=str, default=None,
-                        help="要评估的模型名称（用于baseline_vllm_test目录）")
-    parser.add_argument("--results_dir", type=str, default="results/baseline_vllm_test",
-                        help="包含结果文件的目录")
+    """主函数"""
+    parser = argparse.ArgumentParser(description="评估模型在数据集上的表现")
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+                        help="数据集名称")
+    parser.add_argument("--model_size", type=str, choices=["1.5b", "32b"], default="32b",
+                        help="模型大小")
+    parser.add_argument("--results_dir", type=str, default="results/spec_scale_Inf",
+                        help="结果文件的目录")
     args = parser.parse_args()
-    
-    # 检查参数
-    if args.model_name is None:
-        parser.error("必须指定--model_name参数")
     
     evaluate_model(args)
 
