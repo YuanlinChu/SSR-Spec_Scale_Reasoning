@@ -1,6 +1,7 @@
 # 忽略整个 results 和 logs 文件夹
 results/
 logs/
+previous/
 
 # Python 编译生成的缓存文件
 __pycache__/
