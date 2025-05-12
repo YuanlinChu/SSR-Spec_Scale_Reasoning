@@ -1,4 +1,4 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60 --repeat_id 1 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
+# python spec_scale_reason_2.py --dataset_name aime --problem_id 60 --repeat_id 2 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
 
 import os
 import time
@@ -18,8 +18,8 @@ from vllm import LLM, SamplingParams
 import re
 import random
 # 导入choose-prompts模块中的选择prompt
-from prompts.choose_prompts import aime_choose_prompt, math_choose_prompt, gpqa_choose_prompt
-from prompts.aime_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
+from prompts.choose_prompts import math_choose_prompt, gpqa_choose_prompt
+from prompts.method_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -272,6 +272,8 @@ def parse_arguments():
                         help="Where result pickle files will be written to")
     parser.add_argument("--tensor_parallel_size", type=int, default=4,
                         help="Tensor parallel size for model initialization")
+    parser.add_argument("--method_num", type=int, default=3,
+                        help="Number of solution methods to use (default: 3)")
     return parser.parse_known_args()
 
 def prepare_problem_data(args):
@@ -292,14 +294,23 @@ def prepare_problem_data(args):
         }
     return problem, options
 
-def choose_solution_methods(problem, options, dataset_name, models):
-    """选择最合适的解题方法"""
-    logging.info("选择解题方法...")
+def choose_solution_methods(problem, options, dataset_name, models, method_num=3):
+    """选择最合适的解题方法
+    
+    Args:
+        problem: 问题文本
+        options: 选项（如有）
+        dataset_name: 数据集名称
+        models: 模型字典
+        method_num: 需要选择的解题方法数量，默认为3
+        
+    Returns:
+        包含方法代码的列表
+    """
+    logging.info(f"选择{method_num}个解题方法...")
     
     # 选择合适的prompt
-    if dataset_name == "aime":
-        choose_prompt = aime_choose_prompt
-    elif dataset_name == "math":
+    if dataset_name == "aime" or dataset_name == "math":
         choose_prompt = math_choose_prompt
     elif dataset_name == "gpqa":
         choose_prompt = gpqa_choose_prompt
@@ -307,53 +318,51 @@ def choose_solution_methods(problem, options, dataset_name, models):
         logging.warning(f"未知数据集: {dataset_name}，默认使用math_choose_prompt")
         choose_prompt = math_choose_prompt
     
-    # 准备提示
+    # 准备提示，根据method_num调整要求数量
     prompt = f"{choose_prompt}\n\nProblem: {problem}"
     if options:
         prompt += "\nChoices: "
         for key, value in options.items():
             prompt += f"\n({key}) {value}"
-    prompt = f"{prompt}\n\nExamine the problem and select the **three** strategies (by their codes, e.g. B,E,F) that you believe are most promising for solving it. You only need to output 3 codes, without any other symbols or text\n<think></think>I think the best three methods are: "
-
-    # 设置生成参数
+    prompt = f"{prompt}\n\nExamine the problem and select the **{method_num}** strategies (by their codes, e.g. {'B,E,F' if method_num == 3 else 'B,E,F,A' if method_num == 4 else 'B,E'}) that you believe are most promising for solving it. You only need to output {method_num} codes, without any other symbols or text\n<think></think>I think the best {method_num} methods are: "
+    
+    # 设置生成参数，根据method_num调整max_tokens
     sampling_params = SamplingParams(
         temperature=0,
-        max_tokens=5,
+        max_tokens=method_num * 2-1,  # 每个方法可能需要2个token（字母+逗号）
     )
     
     # 使用目标模型生成方法选择
     outputs = models["target"].generate([prompt], sampling_params)
     method_text = outputs[0].outputs[0].text.strip()
     
-    # 提取方法代码 (期望格式为三个字母，如ABC或A, B, L)
-    # 先尝试提取无分隔符的三个字母
-    methods_match = re.search(r'([A-M]{3})', method_text)
-    if methods_match:
-        methods = list(methods_match.group(1))  # 转换为字符列表
-    else:
-        # 尝试提取有分隔符的格式如"A, B, L"
-        methods_match = re.findall(r'[A-M]', method_text)
-        if len(methods_match) >= 3:
-            methods = methods_match[:3]  # 取前三个
-        else:
-            # 如果无法提取，默认使用MMM
-            logging.warning(f"无法从'{method_text}'提取方法代码，使用默认值MMM")
-            methods = ['M', 'M', 'M']
+    # print(prompt)
+    print(method_text)
+
+    # 提取方法代码
+    methods_match = re.findall(r'[A-M]', method_text)
     
-    # 确保返回3个方法，保持原始顺序
-    while len(methods) < 3:
-        methods.append('M')
+    # 如果提取的方法数量不足，使用'M'填充
+    if len(methods_match) < method_num:
+        logging.warning(f"从'{method_text}'中只提取到{len(methods_match)}个方法代码，不足{method_num}个，使用'M'填充")
+        while len(methods_match) < method_num:
+            methods_match.append('M')
+    elif len(methods_match) > method_num:
+        # 如果提取的方法数量超过需要的数量，截取前method_num个
+        logging.warning(f"从'{method_text}'中提取到{len(methods_match)}个方法代码，超过{method_num}个，只使用前{method_num}个")
+        methods_match = methods_match[:method_num]
     
-    logging.info(f"选择的解题方法: {''.join(methods)}")
-    return methods  # 返回列表形式的方法代码
+    logging.info(f"选择的解题方法: {''.join(methods_match)}")
+
+    return methods_match
 
 def run_reasoning_process(args, problem, options):
     """运行推理过程"""
     start_time_total = time.time()  # 记录整个过程的开始时间
     
     try:
-        # 使用大模型选择解题方法
-        solution_methods = choose_solution_methods(problem, options, args.dataset_name, models)
+        # 使用大模型选择解题方法，使用args.method_num参数
+        solution_methods = choose_solution_methods(problem, options, args.dataset_name, models, args.method_num)
         
         # 为每个方法创建独立的推理轨道，使用索引区分相同方法的不同实例
         method_tracks = {}
@@ -632,6 +641,7 @@ def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, 
         "dataset_name": args.dataset_name,
         "problem": problem,
         "options": options,
+        "method_num": args.method_num,  # 记录使用的方法数量
         "solution_methods": list(method_tracks.keys()),  # 记录使用的解题方法
         "method_tracks": method_tracks,
         "final_results": final_results,
