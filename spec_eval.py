@@ -1,4 +1,4 @@
-# python spec_eval.py --dataset_name aime --model_size 32b --results_dir results/spec_scale_9
+# python spec_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/spec_scale_m
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -365,7 +365,7 @@ def evaluate_model(args):
     logging.info("=" * 50)
     logging.info("评估摘要:")
     logging.info(f"数据集: {args.dataset_name}")
-    logging.info(f"模型: {args.model_size}")
+    logging.info(f"模型: {args.model_name}")
     logging.info(f"结果目录: {model_dir}")
     logging.info(f"总问题数: {total_problems}")
     logging.info(f"总尝试次数: {total_attempts}")
@@ -421,8 +421,8 @@ def main():
     parser = argparse.ArgumentParser(description="评估模型在数据集上的表现")
     parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
                         help="数据集名称")
-    parser.add_argument("--model_size", type=str, choices=["1.5b", "32b"], default="32b",
-                        help="模型大小")
+    parser.add_argument("--model_name", type=str, default="QwQ-32B",
+                        help="base模型名词")
     parser.add_argument("--results_dir", type=str, default="results/spec_scale_Inf",
                         help="结果文件的目录")
     args = parser.parse_args()
