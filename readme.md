@@ -35,6 +35,13 @@
 
 ## 使用方法
 
+### Setup & Installation
+```bash
+git clone https://github.com/YuanlinChu/SSR-Spec_Scale_Reasoning.git
+cd SSR-Spec_Scale_Reasoning
+pip install -r requirements.txt
+```
+
 ### 基准测试
 
 ```bash
