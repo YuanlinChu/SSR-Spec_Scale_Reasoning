@@ -1,4 +1,4 @@
-# SpecLRM 推理实验项目
+# SSR: Speculative Scale Reasoning
 
 本项目实现了一系列基于大型语言模型的数学推理实验，包括基准测试、并行推理和推测性推理（Speculative Reasoning）等方法。
 
