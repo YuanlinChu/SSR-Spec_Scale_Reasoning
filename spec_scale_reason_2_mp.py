@@ -1,4 +1,4 @@
-# python spec_scale_reason_2-modified.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_mp --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5
+# python spec_scale_reason_2_mp.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_mp --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5
 
 import os
 import time

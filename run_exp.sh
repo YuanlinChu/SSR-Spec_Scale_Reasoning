@@ -31,6 +31,6 @@ fi
 
 # 运行GPU占用监控脚本
 echo "启动GPU占用监控..." | tee -a $LOG_FILE
-python ../../GPUoccupy.py --gpu_ids 2 3 --utilization_threshold 60
+python GPUoccupy.py --gpu_ids 4 5 --utilization_threshold 80
 
 echo "所有实验已完成 $(date)" | tee -a $LOG_FILE
