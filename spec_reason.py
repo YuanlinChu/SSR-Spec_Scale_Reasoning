@@ -40,7 +40,7 @@ def initialize_models():
     logging.info("正在加载草稿模型...")
     models["1.5b"] = LLM(
         model=model_names["1.5b"],
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         gpu_memory_utilization=0.1,
         trust_remote_code=True
     )
@@ -49,7 +49,7 @@ def initialize_models():
     logging.info("正在加载目标模型...")
     models["32b"] = LLM(
         model=model_names["32b"],
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         gpu_memory_utilization=0.8,
         trust_remote_code=True
     )
