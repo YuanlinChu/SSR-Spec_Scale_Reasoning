@@ -180,7 +180,7 @@ def analyze_scores(args):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="分析大模型对小模型的打分分布")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="math",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="math",
                         help="数据集名称")
     parser.add_argument("--results_dir", type=str, default="results/spec_scale_m3",
                         help="结果文件的目录")

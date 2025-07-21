@@ -1,28 +1,26 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# python spec_scale_reason_2_fast.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_m5_f1 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5 --fast 1
+# 添加了fast模式
+# 修改了chat-template，该版本更符合chat格式，理应是效果更好，但实测反而准确率下降了，原因未知，所以先不采用
 
 import os
 import time
-# import openai
 import pickle
 import pprint
 import logging
 import argparse
 import numpy as np
-# from openai import OpenAI
-# import statistics
 from collections import Counter
-# from tqdm import tqdm
-# from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
 import re
-# import random
 # 导入choose-prompts模块中的选择prompt
 from prompts.choose_prompts import math_choose_prompt, gpqa_choose_prompt
 from prompts.method_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
 
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+target_model_name = "Qwen/QwQ-32B"
+draft_model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
 # 新增函数: 获取方法提示
 def get_method_prompt(method_code):
@@ -83,6 +81,67 @@ def get_first_user_msg(problem, options=None, method_code=None):
             ans_c=options["C"],
             ans_d=options["D"],
         )
+
+def format_chat(messages,
+                model_name: str,
+                add_generation_prompt: bool = True,
+                continue_final_message: bool = False) -> str:
+    """
+    根据 model_name 选择格式化逻辑，将 messages 列表转换为 prompt 字符串。
+
+    对于 Qwen/QwQ-32B:
+      - ChatML 样式: <|im_start|>role\ncontent<|im_end|>\n
+      - 末尾若 add_generation_prompt，则添加 <|im_start|>assistant\n
+
+    对于 DeepSeek-R1-Distill-Qwen-1.5B:
+      - 深搜自定义格式:
+        开始: <｜begin▁of▁sentence｜>
+        用户: <｜User｜>content
+        助手: <｜Assistant｜>content<｜end▁of▁sentence｜>  （仅在 assistant 后加 end）
+      - 末尾若 add_generation_prompt，则追加 <｜Assistant｜><think>
+      - 若 continue_final_message=True，则最后一条 assistant 不插入 end
+
+    Args:
+      messages: List[{"role": "user"/"assistant", "content": str}]
+      model_name: 模型名称，用于分支选择
+      add_generation_prompt: 是否在末尾加入生成提示
+      continue_final_message: 是否让模型在最后一条消息基础上续写
+    """
+    # Qwen/QwQ-32B 分支（不变）
+    if model_name.lower().startswith("qwen/qwq-32b"):
+        prompt = ""
+        for idx, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+            if continue_final_message and idx == len(messages) - 1:
+                prompt += f"<|im_start|>{role}\n{content}"
+            else:
+                prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+        if add_generation_prompt:
+            prompt += "<|im_start|>assistant\n<think>"
+        return prompt
+
+    # DeepSeek-R1-Distill-Qwen-1.5B 分支（修正后）
+    elif model_name.lower().startswith("deepseek-ai/deepseek-r1-distill-qwen-1.5b"):
+        prompt = "<｜begin▁of▁sentence｜>"
+        for idx, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+            if role == "user":
+                # 只加用户标签和内容，不加 end
+                prompt += f"<｜User｜>{content}"
+            else:  # assistant
+                prompt += f"<｜Assistant｜>{content}"
+                # 仅在 assistant 消息后添加 end，且不在最后一条需续写的情况下
+                if not (continue_final_message and idx == len(messages) - 1):
+                    prompt += "<｜end▁of▁sentence｜>"
+        # 生成提示
+        if add_generation_prompt:
+            prompt += "<｜Assistant｜><think>"
+        return prompt
+
+    else:
+        raise ValueError(f"Unsupported model: {model_name}")
 
 def process_vllm_logprobs(token, logprobs, method, temp=1.0):
     """处理vLLM返回的logprobs"""
@@ -275,6 +334,8 @@ def parse_arguments():
                         help="Tensor parallel size for model initialization")
     parser.add_argument("--method_num", type=int, default=3,
                         help="Number of solution methods to use (default: 3)")
+    parser.add_argument("--fast", type=int, choices=[1, 2], default=None,
+                        help="Fast mode: 1=最快模式(一个答案即停止), 2=次优模式(两个相同答案即停止)")
     return parser.parse_known_args()
 
 def prepare_problem_data(args):
@@ -325,8 +386,13 @@ def choose_solution_methods(problem, options, dataset_name, models, method_num=3
         prompt += "\nChoices: "
         for key, value in options.items():
             prompt += f"\n({key}) {value}"
-    prompt = f"{prompt}\n\nExamine the problem and select the **{method_num}** strategies (by their codes, e.g. {'B,E,F' if method_num == 3 else 'B,E,F,A' if method_num == 4 else 'B,E'}) that you believe are most promising for solving it. You only need to output {method_num} codes, without any other symbols or text\n<think></think>I think the best {method_num} methods are: "
-    
+    prompt = f"{prompt}\n\nExamine the problem and select the **{method_num}** strategies (by their codes, e.g. {'B,E,F' if method_num == 3 else 'B,E,F,A' if method_num == 4 else 'B,E'}) that you believe are most promising for solving it. You only need to output {method_num} codes, without any other symbols or text."
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": f"<think>I think the best {method_num} methods are: "},
+    ]
+    prompt = format_chat(messages, target_model_name, add_generation_prompt=False, continue_final_message=True)
+
     # 设置生成参数，根据method_num调整max_tokens
     sampling_params = SamplingParams(
         temperature=0,
@@ -384,19 +450,57 @@ def run_reasoning_process(args, problem, options):
                 "metadata": [], 
                 "rewrite_count": 0, 
                 "total_steps": 0,
-                "method_code": method_code  # 原始方法代码，不含索引
+                "method_code": method_code,  # 原始方法代码，不含索引
+                "stop_reason": None  # 添加停止原因字段
             }
         
         step_id = 0
         
         while True:
+            # 检查是否满足快速模式条件
+            if args.fast is not None:
+                # 收集已完成且有答案的轨道
+                finished_answers = []
+                for method, track in method_tracks.items():
+                    if track["finished"] and track.get("stop_reason") == "finished":
+                        # 提取最终答案
+                        final_reasoning = "\n\n".join(track["steps"])
+                        answer = extract_final_answer(final_reasoning, args.dataset_name)
+                        if answer is not None:
+                            finished_answers.append(answer)
+                
+                # 快速模式1: 只要有一个答案就停止
+                if args.fast == 1 and len(finished_answers) >= 1:
+                    logging.info(f"快速模式1: 已有一个答案 {finished_answers[0]}，停止其他轨道")
+                    # 标记所有未完成的轨道为已完成
+                    for method, track in method_tracks.items():
+                        if not track["finished"]:
+                            track["finished"] = True
+                            track["stop_reason"] = "fast_mode"
+                    break
+                    
+                # 快速模式2: 有两个相同的答案就停止
+                elif args.fast == 2 and len(finished_answers) >= 2:
+                    # 检查是否有两个相同的答案
+                    answer_counts = Counter(finished_answers)
+                    if answer_counts.most_common(1):  # 确保有答案
+                        most_common_answer, count = answer_counts.most_common(1)[0]
+                        if count >= 2:
+                            logging.info(f"快速模式2: 已有两个相同的答案 {most_common_answer}，停止其他轨道")
+                            # 标记所有未完成的轨道为已完成
+                            for method, track in method_tracks.items():
+                                if not track["finished"]:
+                                    track["finished"] = True
+                                    track["stop_reason"] = "fast_mode"
+                            break
+            
             # 检查是否所有轨道都已完成
             active_methods = [method for method, track in method_tracks.items() if not track["finished"]]
             if not active_methods:
                 break
                 
             logging.info(f"[Step {step_id}] 活跃方法: {active_methods}")
-            
+
             # 1. 为每个活跃方法并行生成下一步推理
             active_prompts = []
             method_mapping = []  # 用于跟踪每个提示对应的方法
@@ -408,10 +512,19 @@ def run_reasoning_process(args, problem, options):
                 
                 if not track["steps"]:  # 第一步
                     prompt = get_first_user_msg(problem, options, method_code=original_method_code)
+                    messages = [
+                        {"role": "user", "content": prompt},
+                    ]
+                    prompt = format_chat(messages, target_model_name, add_generation_prompt=True)       #这里先换成target_model_name的模板试试
                 else:  # 继续之前的消息
                     steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
-                    prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
-                
+                    prompt = get_first_user_msg(problem, options, method_code=original_method_code)
+                    messages = [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": f"<think>{steps_so_far_str}"},
+                    ]
+                    prompt = format_chat(messages, target_model_name, add_generation_prompt=False, continue_final_message=True)
+
                 active_prompts.append(prompt)
                 method_mapping.append(method)
             
@@ -451,8 +564,15 @@ def run_reasoning_process(args, problem, options):
                 steps_for_scoring = track["steps"] + [generated_text]
                 steps_so_far_str = "\n\n".join(steps_for_scoring) + "\n\n"
                 
-                score_prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
-                
+                messages = [
+                    {"role": "user", "content": get_first_user_msg(problem, options, method_code=original_method_code)},
+                    {"role": "assistant", "content": f"<think>{steps_so_far_str}"},  # a </think> cannot be added at the end, otherwise, none of the previous steps will be encoded
+                    {"role": "user", "content": "Evaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9."},
+                    {"role": "assistant", "content": "<think>I think the quality score is: "},
+                ]
+
+                score_prompt = format_chat(messages, target_model_name, add_generation_prompt=False, continue_final_message=True)
+
                 score_prompts.append(score_prompt)
                 score_method_mapping.append(method)
             
@@ -484,11 +604,18 @@ def run_reasoning_process(args, problem, options):
                     track = method_tracks[method]
                     
                     if not track["steps"]:  # 第一步
-                        prompt = get_first_user_msg(problem, options, method_code=original_method_code)
+                        messages = [
+                            {"role": "user", "content": get_first_user_msg(problem, options, method_code=original_method_code)},
+                        ]
+                        prompt = format_chat(messages, target_model_name, add_generation_prompt=True)
                     else:  # 继续之前的消息
                         steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
-                        prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
-                    
+                        messages = [
+                            {"role": "user", "content": get_first_user_msg(problem, options, method_code=original_method_code)},
+                            {"role": "assistant", "content": f"<think>{steps_so_far_str}"},
+                        ]
+                        prompt = format_chat(messages, target_model_name, add_generation_prompt=False, continue_final_message=True)
+
                     rewrite_prompts.append(prompt)
                     rewrite_method_mapping.append(method)
                 else:

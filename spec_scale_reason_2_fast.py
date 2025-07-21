@@ -1,5 +1,5 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
-
+# python spec_scale_reason_2_fast.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2_m5_t7_f1 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5 --fast 1
+# 添加了fast模式
 import os
 import time
 # import openai
@@ -18,7 +18,7 @@ from vllm import LLM, SamplingParams
 import re
 # import random
 # 导入choose-prompts模块中的选择prompt
-from prompts.choose_prompts import math_choose_prompt, gpqa_choose_prompt
+from prompts.choose_prompts import math_choose_prompt
 from prompts.method_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
 
 
@@ -205,6 +205,8 @@ def extract_final_answer(reasoning, dataset_name):
 def get_dataset(dataset_name):
     if dataset_name == "aime":
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
+    elif dataset_name == "live":
+        dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
     elif dataset_name == "math":
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
     elif dataset_name == "gpqa":
@@ -256,7 +258,7 @@ def parse_problem_range(problem_id_str):
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="Runs speculative reasoning using a small model")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="Dataset")
     parser.add_argument("--score_threshold", type=float, default=7.0, 
                         help="Acceptance threshold")
@@ -275,6 +277,8 @@ def parse_arguments():
                         help="Tensor parallel size for model initialization")
     parser.add_argument("--method_num", type=int, default=3,
                         help="Number of solution methods to use (default: 3)")
+    parser.add_argument("--fast", type=int, choices=[1, 2], default=None,
+                        help="Fast mode: 1=最快模式(一个答案即停止), 2=次优模式(两个相同答案即停止)")
     return parser.parse_known_args()
 
 def prepare_problem_data(args):
@@ -284,6 +288,9 @@ def prepare_problem_data(args):
         options = None
     elif args.dataset_name == "math":
         problem = args.dataset["problem"][args.problem_id]
+        options = None
+    elif args.dataset_name == "live":
+        problem = args.dataset["question"][args.problem_id]
         options = None
     elif args.dataset_name == "gpqa":
         problem = args.dataset["Question"][args.problem_id]
@@ -313,8 +320,8 @@ def choose_solution_methods(problem, options, dataset_name, models, method_num=3
     # 选择合适的prompt
     if dataset_name == "aime" or dataset_name == "math":
         choose_prompt = math_choose_prompt
-    elif dataset_name == "gpqa":
-        choose_prompt = gpqa_choose_prompt
+    # elif dataset_name == "live":
+    #     choose_prompt = live_choose_prompt
     else:
         logging.warning(f"未知数据集: {dataset_name}，默认使用math_choose_prompt")
         choose_prompt = math_choose_prompt
@@ -384,12 +391,50 @@ def run_reasoning_process(args, problem, options):
                 "metadata": [], 
                 "rewrite_count": 0, 
                 "total_steps": 0,
-                "method_code": method_code  # 原始方法代码，不含索引
+                "method_code": method_code,  # 原始方法代码，不含索引
+                "stop_reason": None  # 添加停止原因字段
             }
         
         step_id = 0
         
         while True:
+            # 检查是否满足快速模式条件
+            if args.fast is not None:
+                # 收集已完成且有答案的轨道
+                finished_answers = []
+                for method, track in method_tracks.items():
+                    if track["finished"] and track.get("stop_reason") == "finished":
+                        # 提取最终答案
+                        final_reasoning = "\n\n".join(track["steps"])
+                        answer = extract_final_answer(final_reasoning, args.dataset_name)
+                        if answer is not None:
+                            finished_answers.append(answer)
+                
+                # 快速模式1: 只要有一个答案就停止
+                if args.fast == 1 and len(finished_answers) >= 1:
+                    logging.info(f"快速模式1: 已有一个答案 {finished_answers[0]}，停止其他轨道")
+                    # 标记所有未完成的轨道为已完成
+                    for method, track in method_tracks.items():
+                        if not track["finished"]:
+                            track["finished"] = True
+                            track["stop_reason"] = "fast_mode"
+                    break
+                    
+                # 快速模式2: 有两个相同的答案就停止
+                elif args.fast == 2 and len(finished_answers) >= 2:
+                    # 检查是否有两个相同的答案
+                    answer_counts = Counter(finished_answers)
+                    if answer_counts.most_common(1):  # 确保有答案
+                        most_common_answer, count = answer_counts.most_common(1)[0]
+                        if count >= 2:
+                            logging.info(f"快速模式2: 已有两个相同的答案 {most_common_answer}，停止其他轨道")
+                            # 标记所有未完成的轨道为已完成
+                            for method, track in method_tracks.items():
+                                if not track["finished"]:
+                                    track["finished"] = True
+                                    track["stop_reason"] = "fast_mode"
+                            break
+                        
             # 检查是否所有轨道都已完成
             active_methods = [method for method, track in method_tracks.items() if not track["finished"]]
             if not active_methods:

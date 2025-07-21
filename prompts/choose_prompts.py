@@ -18,6 +18,22 @@ M. Unknown: I cannot confidently determine which strategy is suitable from the l
 If you are uncertain about which strategy to choose, you may select option M multiple times.
 """
 
-gpqa_choose_prompt = """
-You will be given a question from the GPQA competition. First, read the list of possible solution strategies below (A–M), then select strategies that are most promising for solving the problem.
+live_choose_prompt = """
+You will be given a question from the live competition. First, read the list of possible solution strategies below (A–M), then select strategies that are most promising for solving the problem.
+
+A. Algebraic Simplification and Transformation: Simplifying algebraic expressions through expansion, factorization, combining like terms, etc.
+B. Clever Substitution and Replacement: Introducing new variables or replacing existing ones to simplify problem structure.
+C. Coordinate Geometry Method: Using a coordinate system to transform geometric problems into algebraic ones for solutions.
+D. Application of Complex Numbers in Geometry: Using complex numbers and their algebraic properties to solve plane geometry problems.
+E. Number Theory Techniques and Methods: Dealing with properties of integers, divisibility, remainders, etc.
+F. Combinatorial Counting Principles: Using methods like permutations and combinations to solve counting problems.
+G. Probability Models and Expected Values: Using probability and expectation to handle random events and average outcomes.
+H. Functional Equations and Special Functions Strategy: Analyzing and solving equations involving functions or utilizing properties of special functions.
+I. Recursive Patterns and Invariants: Analyzing unchanging characteristics or recursive relationships in sequences or processes.
+J. Geometric Intuition and Synthetic Method: Using geometric properties, theorems, and intuitive understanding to solve geometric problems.
+K. Casework Analysis and Construction Method: Enumerating all cases or constructing instances to solve problems.
+L. Calculus and Inequality Strategy: Applying derivatives, integrals, extrema, and inequality techniques to solve problems.
+M. Unknown: I cannot confidently determine which strategy is suitable from the list above.
+
+If you are uncertain about which strategy to choose, you may select option M multiple times.
 """

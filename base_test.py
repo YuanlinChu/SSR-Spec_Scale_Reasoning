@@ -83,6 +83,8 @@ def get_dataset(dataset_name):
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
     elif dataset_name == "math":
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
+    elif dataset_name == "live":
+        dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
     elif dataset_name == "gpqa":
         if os.getenv("HF_HUB_OFFLINE", "0") == "1":
             dataset = load_from_disk("/scratch/gpfs/rp2773/hf_cache/datasets/gpqa")
@@ -104,6 +106,9 @@ def run_baseline_test(args, problem_id, repeat_id):
         options = None
     elif args.dataset_name == "math":
         problem = dataset["problem"][problem_id]
+        options = None
+    elif args.dataset_name == "live":
+        problem = dataset["question"][problem_id]
         options = None
     elif args.dataset_name == "gpqa":
         problem = dataset["Question"][problem_id]
@@ -275,11 +280,11 @@ def extract_final_answer(reasoning, dataset_name):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="使用vllm原生接口运行推理")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="数据集")
     parser.add_argument("--token_budget", type=int, default=8192,
                         help="最大输出令牌数")
-    # problem_id: 60-89 for AIME, 0-99 for math, 0-99 for GPQA
+    # problem_id: 60-89 for AIME, 0-99 for math, 0-99 for GPQA, 0-45 for Live
     parser.add_argument("--problem_id", type=str, default="60",
                         help="查询ID (AIME为60-89)，可以是单个ID或范围，例如：60-89")
     parser.add_argument("--repeat_id", type=int, default=1,

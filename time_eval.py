@@ -25,6 +25,9 @@ def evaluate_baseline_time(args):
         if args.dataset_name == "aime":
             dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
             id_offset = 60  # AIME问题ID从60开始
+        elif args.dataset_name == "live":
+            dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
+            id_offset = 0
         elif args.dataset_name == "math":
             dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
             id_offset = 0
@@ -162,6 +165,9 @@ def evaluate_spec_scale_time(args):
         elif args.dataset_name == "math":
             dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
             id_offset = 0
+        elif args.dataset_name == "live":
+            dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
+            id_offset = 0
         elif args.dataset_name == "gpqa":
             if os.getenv("HF_HUB_OFFLINE", "0") == "1":
                 dataset = load_from_disk("/scratch/gpfs/rp2773/hf_cache/datasets/gpqa")
@@ -184,7 +190,7 @@ def evaluate_spec_scale_time(args):
     # 初始化时间统计数据
     all_times = []  # 所有情况下的时间消耗
     best_result_times = []  # 只有best_result不为None的时间消耗
-    
+    data_count = 0
     # 遍历结果文件
     for filename in os.listdir(model_dir):
         if not filename.endswith(".pickle"):
@@ -210,22 +216,21 @@ def evaluate_spec_scale_time(args):
         try:
             with open(file_path, "rb") as f:
                 data = pickle.load(f)
-                
             # 提取时间数据
             total_time = data.get("total_time")
             
             if total_time is not None:
                 # 记录所有情况下的时间
                 all_times.append(total_time)
-                
+
                 # 检查best_result是否为None
                 best_result = data.get("best_result")
-                if best_result is not None:
+                answer = data.get("answer") #为了兼容spec_reason.py的结果
+                if best_result is not None or answer is not None:
                     best_result_times.append(total_time)
                 
         except Exception as e:
             logging.error(f"处理文件 {file_path} 时出错: {e}")
-
     # 计算统计信息
     if all_times:
         avg_all_time = np.mean(all_times)
@@ -285,7 +290,7 @@ def evaluate_spec_scale_time(args):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="评估模型的时间消耗")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="数据集名称")
     parser.add_argument("--model_name", type=str, default=None,
                         help="baseline模型名称（用于baseline_vllm_test目录）")

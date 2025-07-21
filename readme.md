@@ -5,6 +5,7 @@ Large language models (LLMs) have achieved impressive results on multi-step math
 ![SSR Framework](SSR_Framework.png)
 
 ## Project Structure
+## Project Structure
 
 ### reason
 
@@ -50,34 +51,34 @@ pip install -r requirements.txt
 python base_test.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name Qwen/QwQ-32B --output_dir results/baseline_vllm_test
 ```
 
-### Parallel Reasoning
+### parallel reasoning
 
 ```bash
 python scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name Qwen/QwQ-32B --output_dir results/scale_reason --use_role_prompts
 ```
 
-### Speculative Reasoning
+### spec + scale(role prompt)
 
 ```bash
 python spec_scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
 ```
 
-### Method Path Selection Reasoning
+### spec + scale(method prompt)
 
 ```bash
 python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_m --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
 ```
 
-### Evaluate Results
+### Evaluation
 
 ```bash
 python baseline_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/baseline_vllm_test
 python spec_eval.py --dataset_name aime --model_name QwQ-32b --results_dir results/spec_scale_m
 ```
 
-## Dataset Support
+## Dataset support
 
-This project supports multiple mathematical reasoning datasets:
-- AIME (American Invitational Mathematics Examination)
-- MATH (Complex Mathematical Problem Set)
+This project supports a variety of mathematical reasoning datasets:
+- AIME (American Invitational Mathematics Competition)
+- MATH (Complex Mathematics Problem Set)
 - GPQA (Multiple Choice Question Answering)

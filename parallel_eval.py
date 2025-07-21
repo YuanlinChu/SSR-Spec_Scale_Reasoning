@@ -1,4 +1,4 @@
-#python parallel_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/scale_reason_norole --plot
+#python parallel_eval.py --dataset_name live --model_name QwQ-32B --results_dir results/scale_reason_r3_noprompt --plot
 #这个代码是评估准确率随着并行数量的变化（用pass@k来代表），分析到了一定数量后再增加就收效不大了
 
 import os
@@ -33,7 +33,7 @@ def get_ground_truth(dataset, problem_idx, dataset_name):
         except (ValueError, TypeError, KeyError) as e:
             logging.error(f"获取AIME索引{problem_idx}的正确答案时出错: {e}. 答案字符串: {dataset[problem_idx].get('answer', 'N/A')}")
             return None
-    elif dataset_name == "math":
+    elif dataset_name in ["math", "live"]:
         try:
             answer_str = dataset[problem_idx].get("answer", "")
             try:
@@ -79,7 +79,7 @@ def compare_answers(model_answer, ground_truth, dataset_name):
         if dataset_name in ["aime"]:
             # 尝试数值比较
             return int(model_answer) == int(ground_truth)
-        elif dataset_name == "math":
+        elif dataset_name in ["math", "live"]:
             # 对于MATH数据集，需要处理复杂的数学表达式
             # 规范化处理：移除所有空格和LaTeX命令
             def normalize_math_expr(expr):
@@ -125,6 +125,10 @@ def compare_answers(model_answer, ground_truth, dataset_name):
 
                 # 标准化平方根参数: \sqrt{x} 和 \sqrt x 转换为相同形式
                 expr = re.sub(r'\\sqrt\{(.*?)\}', r'\\sqrt\1', expr)
+                
+                # 特别为LiveMathBench添加：移除美元符号
+                expr = re.sub(r'^\$(.*)\$$', r'\1', expr)
+                expr = re.sub(r'^\$(.*)\$', r'\1', expr)
                 
                 return expr
             
@@ -248,6 +252,9 @@ def evaluate_model(args):
             id_offset = 60  # AIME问题ID从60开始
         elif args.dataset_name == "math":
             dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
+            id_offset = 0
+        elif args.dataset_name == "live":
+            dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
             id_offset = 0
         elif args.dataset_name == "gpqa":
             if os.getenv("HF_HUB_OFFLINE", "0") == "1":
@@ -415,7 +422,7 @@ def evaluate_model(args):
 
 def main():
     parser = argparse.ArgumentParser(description="评估模型在数据集上的表现")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], required=True,
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], required=True,
                         help="要评估的数据集")
     parser.add_argument("--model_name", type=str, required=True,
                         help="要评估的模型名称")

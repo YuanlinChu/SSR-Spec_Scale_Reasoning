@@ -1,4 +1,4 @@
-# python spec_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/spec_scale_m
+# python spec_scale_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/spec_scale_m
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -12,6 +12,9 @@ import numpy as np
 from collections import defaultdict
 from datasets import load_dataset, load_from_disk
 from metric import pass_at_k
+import sympy
+from sympy.parsing.latex import parse_latex
+import math
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -96,6 +99,18 @@ def get_ground_truth(dataset, problem_idx, dataset_name):
         except (ValueError, TypeError, KeyError) as e:
             logging.error(f"获取AIME索引{problem_idx}的正确答案时出错: {e}. 答案字符串: {dataset[problem_idx].get('answer', 'N/A')}")
             return None
+    elif dataset_name == "live":
+        try:
+            answer_str = dataset[problem_idx].get("answer", "")
+            try:
+                # 尝试直接转换为整数
+                return int(answer_str)
+            except ValueError:
+                # 如果不是整数，返回原始答案字符串
+                return answer_str
+        except (KeyError, TypeError) as e:
+            logging.error(f"获取LiveMathBench索引{problem_idx}的答案时出错: {e}")
+            return None
     elif dataset_name == "math":
         try:
             answer_str = dataset[problem_idx].get("answer", "")
@@ -151,7 +166,59 @@ def get_ground_truth(dataset, problem_idx, dataset_name):
 #         # 如果数值转换失败，则回退到字符串比较
 #         logging.warning(f"{dataset_name}的数值比较失败。以字符串形式比较: '{model_answer}' vs '{ground_truth}'")
 #         return str(model_answer).strip() == str(ground_truth).strip()
-
+            
+# 规范化处理：移除所有空格和LaTeX命令
+def normalize_math_expr(expr):
+    if not isinstance(expr, str):
+        return str(expr)
+    
+    # 移除美元符号
+    expr = re.sub(r'^\$(.*)\$$', r'\1', expr)
+    expr = re.sub(r'^\$(.*)\$', r'\1', expr)
+    
+    # 移除千位分隔符（逗号）
+    expr = re.sub(r'(\d),(\d)', r'\1\2', expr)
+    
+    # 移除所有空格
+    expr = re.sub(r'\s+', '', expr)
+    
+    # 标准化分数表示: \dfrac 和 \frac 转换为相同形式
+    expr = re.sub(r'\\dfrac', r'\\frac', expr)
+    
+    # 标准化文本表示: 移除 \text
+    expr = re.sub(r'\\text\{(.*?)\}', r'\1', expr)
+    
+    # 标准化平方根表示: 处理不同的 \sqrt 写法
+    expr = re.sub(r'\\\\sqrt', r'\\sqrt', expr)
+    
+    # 确保 \sqrt 后有花括号 - 修复 \sqrt2 变成 \sqrt{2}
+    expr = re.sub(r'\\sqrt(\d+)', r'\\sqrt{\1}', expr)
+    
+    # 移除度数符号
+    expr = re.sub(r'(\d+)\^\\circ', r'\1', expr)
+    
+    # 移除LaTeX命令如\left和\right
+    expr = re.sub(r'\\left|\\\right', '', expr)
+    
+    # 标准化括号
+    expr = re.sub(r'\\left\(', '(', expr)
+    expr = re.sub(r'\\right\)', ')', expr)
+    
+    # 标准化矩阵表示
+    expr = re.sub(r'\\begin\{pmatrix\}(.*?)\\end\{pmatrix\}', lambda m: m.group(1).replace('\\\\', ','), expr)
+    
+    # 确保分数表示正确 (如 1/2 的形式)
+    # 这步不要转换，保留LaTeX格式更容易被sympy正确解析
+    # expr = re.sub(r'\\frac\{(.*?)\}\{(.*?)\}', r'\1/\2', expr)
+    
+    # 处理 \pm 符号（正负号）
+    expr = re.sub(r'\\pm', r'\\pm ', expr)
+    
+    # 处理 x= 这样的前缀
+    expr = re.sub(r'^[a-z]=', '', expr)
+    
+    return expr
+                
 def compare_answers(model_answer, ground_truth, dataset_name):
     """
     比较模型答案与正确答案
@@ -164,54 +231,64 @@ def compare_answers(model_answer, ground_truth, dataset_name):
         if dataset_name in ["aime"]:
             # 尝试数值比较
             return int(model_answer) == int(ground_truth)
-        elif dataset_name == "math":
+        elif dataset_name in ["live"]:
+            # 首先尝试规范化后的直接字符串比较
+            norm_model = normalize_math_expr(model_answer)
+            norm_truth = normalize_math_expr(ground_truth)
+            
+            # 对于纯数字，提取并比较
+            try:
+                # 使用正则表达式提取数字部分
+                model_digits = re.sub(r'[^\d]', '', norm_model)
+                truth_digits = re.sub(r'[^\d]', '', norm_truth)
+                
+                if model_digits and truth_digits:
+                    if int(model_digits) == int(truth_digits):
+                        return True
+            except:
+                pass
+            
+            # 如果规范化后完全相同
+            if norm_model == norm_truth:
+                return True
+            
+            # 尝试使用更复杂的数学表达式比较
+            if compare_math_expressions(norm_model, norm_truth):
+                return True
+            
+            # 特别处理根式表达式
+            # 对于您提供的例子 3\sqrt{15} 和 15\sqrt{7}
+            sqrt_pattern = r'(\d*(?:\.\d+)?)\\sqrt\{(\d+(?:\.\d+)?)\}'
+            
+            model_sqrt_match = re.match(sqrt_pattern, norm_model)
+            truth_sqrt_match = re.match(sqrt_pattern, norm_truth)
+            
+            if model_sqrt_match and truth_sqrt_match:
+                try:
+                    # 提取系数和根号内的数字
+                    model_coef = float(model_sqrt_match.group(1) or 1)
+                    model_rad = float(model_sqrt_match.group(2))
+                    
+                    truth_coef = float(truth_sqrt_match.group(1) or 1)
+                    truth_rad = float(truth_sqrt_match.group(2))
+                    
+                    # 计算数值
+                    model_value = model_coef * math.sqrt(model_rad)
+                    truth_value = truth_coef * math.sqrt(truth_rad)
+                    
+                    # 比较数值
+                    return abs(model_value - truth_value) < 1e-9
+                except:
+                    pass
+            
+            # 如果所有比较方法都失败，返回False
+            logging.warning(f"无法匹配的数学表达式: '{model_answer}' vs '{ground_truth}'")
+            logging.warning(f"规范化后: '{norm_model}' vs '{norm_truth}'")
+            
+            return False
+            
+        elif dataset_name in ["math"]:
             # 对于MATH数据集，需要处理复杂的数学表达式
-            # 规范化处理：移除所有空格和LaTeX命令
-            def normalize_math_expr(expr):
-                if not isinstance(expr, str):
-                    return str(expr)
-                
-                # 移除所有空格
-                expr = re.sub(r'\s+', '', expr)
-                
-                # 标准化分数表示: \dfrac 和 \frac 转换为相同形式
-                expr = re.sub(r'\\dfrac', r'\\frac', expr)
-                
-                # 规范化分数表示
-                expr = re.sub(r'\\frac\{(.*?)\}\{(.*?)\}', r'\1/\2', expr)
-                
-                # 标准化文本表示: 移除 \text
-                expr = re.sub(r'\\text\{(.*?)\}', r'\1', expr)
-                
-                # 标准化平方根表示: 处理不同的 \sqrt 写法
-                expr = re.sub(r'\\\\sqrt', r'\\sqrt', expr)
-                
-                # 移除度数符号
-                expr = re.sub(r'(\d+)\^\\circ', r'\1', expr)
-                
-                # 移除LaTeX命令如\left和\right
-                expr = re.sub(r'\\left|\\\right', '', expr)
-                
-                # 标准化括号
-                expr = re.sub(r'\\left\(', '(', expr)
-                expr = re.sub(r'\\right\)', ')', expr)
-                
-                # 标准化矩阵表示
-                expr = re.sub(r'\\begin\{pmatrix\}(.*?)\\end\{pmatrix\}', lambda m: m.group(1).replace('\\\\', ','), expr)
-                
-                # 标准化分数表示中的除号
-                expr = re.sub(r'(\d+)/(\d+)', lambda m: f"{m.group(1)}/{m.group(2)}", expr)
-                
-                # 处理 \pm 符号（正负号）
-                expr = re.sub(r'\\pm', 'pm', expr)
-                
-                # 处理 x= 这样的前缀
-                expr = re.sub(r'^[a-z]=', '', expr)
-
-                # 标准化平方根参数: \sqrt{x} 和 \sqrt x 转换为相同形式
-                expr = re.sub(r'\\sqrt\{(.*?)\}', r'\\sqrt\1', expr)
-                
-                return expr
             
             norm_model = normalize_math_expr(model_answer)
             norm_truth = normalize_math_expr(ground_truth)
@@ -244,6 +321,46 @@ def compare_answers(model_answer, ground_truth, dataset_name):
         # logging.warning(f"{dataset_name}的数值比较失败。以字符串形式比较: '{model_answer}' vs '{ground_truth}'")
         return str(model_answer).strip() == str(ground_truth).strip()
 
+def compare_math_expressions(expr1, expr2):
+    """比较两个数学表达式是否等价，先尝试符号比较，再尝试数值比较"""
+    try:
+        # 1. 尝试使用sympy进行符号比较
+        expr1_sympy = parse_latex(expr1)
+        expr2_sympy = parse_latex(expr2)
+        
+        # 符号差异
+        diff = sympy.simplify(expr1_sympy - expr2_sympy)
+        if diff == 0:
+            return True
+            
+        # 2. 对于除法表达式，尝试比较比值
+        try:
+            ratio = sympy.simplify(expr1_sympy / expr2_sympy)
+            if ratio == 1:
+                return True
+        except:
+            pass
+            
+        # 3. 尝试数值比较
+        try:
+            val1 = float(sympy.N(expr1_sympy))
+            val2 = float(sympy.N(expr2_sympy))
+            
+            # 对于大数值，使用相对误差
+            if max(abs(val1), abs(val2)) > 1.0:
+                relative_error = abs(val1 - val2) / max(abs(val1), abs(val2))
+                return relative_error < 1e-9
+            else:
+                # 对于小数值，使用绝对误差
+                return abs(val1 - val2) < 1e-9
+        except:
+            pass
+            
+        return False
+    except Exception as e:
+        # 如果符号比较失败，记录错误但不抛出异常
+        return False
+
 def evaluate_model(args):
     """评估模型在数据集上的表现"""
     logging.info(f"开始评估数据集: {args.dataset_name}")
@@ -256,6 +373,9 @@ def evaluate_model(args):
             id_offset = 60  # AIME问题ID从60开始
         elif args.dataset_name == "math":
             dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
+            id_offset = 0
+        elif args.dataset_name == "live":
+            dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
             id_offset = 0
         elif args.dataset_name == "gpqa":
             if os.getenv("HF_HUB_OFFLINE", "0") == "1":
@@ -419,7 +539,7 @@ def evaluate_model(args):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="评估模型在数据集上的表现")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="数据集名称")
     parser.add_argument("--model_name", type=str, default="QwQ-32B",
                         help="base模型名词")

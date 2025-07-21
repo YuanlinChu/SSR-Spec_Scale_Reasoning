@@ -1,5 +1,5 @@
-# python spec_reason.py --dataset_name aime --problem_id 60 --repeat_id 2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --output_dir results/spec_7
-
+# python api_spec_reason.py --dataset_name aime --problem_id 60 --repeat_id 3 --score_threshold 7.0 --token_budget 8192 --score_method greedy --output_dir results/api_spec_7
+# api版本的投机推理
 import os
 import time
 import pickle
@@ -10,8 +10,8 @@ import numpy as np
 import statistics
 from collections import Counter
 from datasets import load_dataset, load_from_disk
-from vllm import LLM, SamplingParams
 import re
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -21,37 +21,27 @@ def get_avg_score(scores):
 def get_frequency(scores):
     return dict(Counter(scores))
 
-# 初始化模型
+def get_model(model_size):
+    client = clients[model_size]
+    models = client.models.list()
+    model = models.data[0].id
+    return model
+
+# 初始化模型名称
 model_names = {
     "1.5b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     "32b": "Qwen/QwQ-32B",
 }
-
-# 初始化全局模型变量
-models = {}
-
-def initialize_models():
-    """初始化模型"""
-    global models
-    
-    # 初始化小模型
-    logging.info("正在加载草稿模型...")
-    models["1.5b"] = LLM(
-        model=model_names["1.5b"],
-        tensor_parallel_size=4,
-        gpu_memory_utilization=0.15,
-        trust_remote_code=True
+ports = {
+    "1.5b": "30001",
+    "32b": "30000",
+}
+clients = {}
+for size, full_name in model_names.items():
+    clients[size] = OpenAI(
+        api_key="EMPTY",
+        base_url=f"http://localhost:{ports[size]}/v1",
     )
-    
-    # 初始化大模型
-    logging.info("正在加载目标模型...")
-    models["32b"] = LLM(
-        model=model_names["32b"],
-        tensor_parallel_size=4,
-        gpu_memory_utilization=0.75,
-        trust_remote_code=True
-    )
-    logging.info("模型初始化完成")
 
 def get_first_user_msg(problem, options=None):
     if options is None:
@@ -85,71 +75,83 @@ def get_first_user_msg(problem, options=None):
         )
 
 def generate_new_step(problem, steps_so_far, model_size, options=None, stop_token="\n\n"):
-    global models
-    model = models[model_size]
+    client = clients[model_size]
     
     if steps_so_far == []:  # first step
-        prompt = get_first_user_msg(problem, options)
+        messages = [
+            {"role": "user", "content": get_first_user_msg(problem, options)},
+        ]
+        extra_body = {"add_generation_prompt": True}
     else:  # continuing on from a previous message
         steps_so_far_str = "\n\n".join(steps_so_far) + "\n\n"
-        prompt = f"{get_first_user_msg(problem, options)}\n<think>{steps_so_far_str}"
+        messages = [
+            {"role": "user", "content": get_first_user_msg(problem, options)},
+            {"role": "assistant", "content": f"<think>{steps_so_far_str}"},
+        ]
+        extra_body = {"add_generation_prompt": False, "continue_final_message": True}
     
-    # 设置采样参数
-    sampling_params = SamplingParams(
-        temperature=0.6,
-        top_p=0.95,
+    response = client.chat.completions.create(
+        model=get_model(model_size),
+        messages=messages,
+        temperature=0.6, top_p=0.95, # https://huggingface.co/Qwen/QwQ-32B#usage-guidelines
         max_tokens=512,
-        stop=[stop_token]
+        stop=[stop_token],
+        extra_body=extra_body,
     )
-    
-    # 生成回答
-    outputs = model.generate([prompt], sampling_params)
-    output = outputs[0]
-    
-    step_str = output.outputs[0].text
-    num_output_tokens = len(output.outputs[0].token_ids)
+
+    step_str = response.choices[0].message.content
+    # num_input_tokens = response.usage.prompt_tokens
+    num_output_tokens = response.usage.completion_tokens
+    # finished = "boxed" in step_str
     finished = any([x in step_str for x in ["boxed", "Answer:", "ANSWER:"]])
     
     return step_str, finished, num_output_tokens
 
 def get_score(args, problem, steps_so_far, model_size="32b", options=None):
-    global models
-    model = models[model_size]
+    client = clients[model_size]
     
     steps_so_far_str = "\n\n".join(steps_so_far) + "\n\n"
-    prompt = f"{get_first_user_msg(problem, options)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
+    messages = [
+        {"role": "user", "content": get_first_user_msg(problem, options)},
+        {"role": "assistant", "content": f"<think>{steps_so_far_str}"},  # a </think> cannot be added at the end, otherwise, none of the previous steps will be encoded
+        {"role": "user", "content": "Evaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9."},
+        {"role": "assistant", "content": "<think>I think the quality score is: "},
+    ]
     
-    # 设置采样参数
-    sampling_params = SamplingParams(
+    response = client.chat.completions.create(
+        model=get_model(model_size),
+        messages=messages,
         temperature=0.0,
         max_tokens=1,
-        logprobs=10
+        logprobs=True,  # the docs said that this should be an int hmmmmmm https://docs.vllm.ai/en/v0.6.4/dev/sampling_params.html
+        top_logprobs=10,  # https://github.com/vllm-project/vllm/issues/13881 
+        extra_body={
+            "add_generation_prompt": False, "continue_final_message": True,
+            # "return_tokens_as_token_ids": True,
+        },
     )
+    justification = response.choices[0].message.content
     
-    # 生成评分
-    outputs = model.generate([prompt], sampling_params)
-    output = outputs[0]
+    score = process_logprobs(response, method=args.score_method)
     
-    token = output.outputs[0].text
-    logprobs = output.outputs[0].logprobs[0]
-    
-    score = process_vllm_logprobs(token, logprobs, method=args.score_method)
-    
-    return score, token, output
+    return score, justification, response
 
-def process_vllm_logprobs(token, logprobs, method, temp=1.0):
-    """处理vLLM返回的logprobs"""
-    # 过滤出数字token的概率
-    digit_logprobs = {k: v for k, v in logprobs.items()}
-    
+def process_logprobs(response, method, temp=1.0):
+    """处理API返回的logprobs"""
+    assert len(response.choices[0].logprobs.content) == 1
+    token = response.choices[0].logprobs.content[0].token  # example: '1', '0'
+    token_logprobs = {t.token: t.logprob for t in response.choices[0].logprobs.content[0].top_logprobs}
+    logging.info(f"Original token_logprobs: {token_logprobs}")
+    token_logprobs = {k: v for k, v in token_logprobs.items() if k.isdigit()}  # filter out non-digit values
+
     if method == "greedy":
-        # 返回生成的token
+        # return the vanilla response
         if not token.isdigit():
             return 0
         return int(token)
     elif method == "average":
-        # 转换为概率并归一化
-        probs = {tok: np.exp(lp / temp) for tok, lp in digit_logprobs.items()}
+        # Convert log probabilities to probabilities and normalize each distribution.
+        probs = {tok: np.exp(lp / temp) for tok, lp in token_logprobs.items()}
         total_probs = sum(probs.values())
         for tok in probs:
             probs[tok] /= total_probs
@@ -169,8 +171,6 @@ def get_dataset(dataset_name):
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
     elif dataset_name == "math":
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
-    elif dataset_name == "live":
-        dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
     elif dataset_name == "gpqa":
         if os.getenv("HF_HUB_OFFLINE", "0") == "1":
             dataset = load_from_disk("/scratch/gpfs/rp2773/hf_cache/datasets/gpqa")
@@ -247,7 +247,7 @@ def extract_final_answer(reasoning, dataset_name):
             if match_answer:
                 return match_answer.group(1).upper()
 
-        logging.warning(f"在最终步骤中找不到\\boxed{{}}模式")
+        logging.warning("在最终步骤中找不到\\boxed{{}}模式")
         return None
 
 def run_speculative_reasoning(args, problem_id, repeat_idx):
@@ -260,9 +260,6 @@ def run_speculative_reasoning(args, problem_id, repeat_idx):
         options = None
     elif args.dataset_name == "math":
         problem = dataset["problem"][problem_id]
-        options = None
-    elif args.dataset_name == "live":
-        problem = dataset["question"][problem_id]
         options = None
     elif args.dataset_name == "gpqa":
         problem = dataset["Question"][problem_id]
@@ -405,7 +402,7 @@ def run_speculative_reasoning(args, problem_id, repeat_idx):
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="Runs speculative reasoning using a small model")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa","live"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
                         help="Dataset")
     parser.add_argument("--score_threshold", type=float, default=7.0, 
                         help="Acceptance threshold")
@@ -431,9 +428,6 @@ def main():
     
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
-    
-    # 初始化模型
-    initialize_models()
     
     # 加载数据集
     args.dataset = get_dataset(args.dataset_name)

@@ -153,6 +153,9 @@ def run_baseline_test(args, problem_id, repeat_id):
     if args.dataset_name == "aime":
         problem = dataset["problem"][problem_id - 60]
         options = None
+    elif args.dataset_name == "live":
+        problem = dataset["question"][problem_id]
+        options = None
     elif args.dataset_name == "math":
         problem = dataset["problem"][problem_id]
         options = None
@@ -385,6 +388,8 @@ def extract_final_answer(reasoning, dataset_name):
 def get_dataset(dataset_name):
     if dataset_name == "aime":
         dataset = load_dataset("HuggingFaceH4/aime_2024")["train"]
+    elif dataset_name == "live":
+        dataset = load_dataset("opencompass/LiveMathBench", "v202412_AMC_en")["test"]
     elif dataset_name == "math":
         dataset = load_dataset("HuggingFaceH4/MATH-500")["test"]
     elif dataset_name == "gpqa":
@@ -436,7 +441,7 @@ def parse_problem_range(problem_id_str):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="并行缩放模型")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="数据集")
     parser.add_argument("--token_budget", type=int, default=8192,
                         help="最大输出令牌数")

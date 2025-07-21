@@ -111,7 +111,7 @@ def analyze_rewrite_tokens(args):
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="分析改写率和token数")
-    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa"], default="aime",
+    parser.add_argument("--dataset_name", type=str, choices=["aime", "math", "gpqa", "live"], default="aime",
                         help="数据集名称")
     parser.add_argument("--results_dir", type=str, default="results/spec_scale_2_m5_t7",
                         help="结果文件的目录")

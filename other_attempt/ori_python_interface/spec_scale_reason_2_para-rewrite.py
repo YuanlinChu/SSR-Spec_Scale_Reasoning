@@ -1,4 +1,6 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# python spec_scale_reason_2_para-rewrite.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_m5_optimized --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5
+# 该方法做的是强行积攒一定数量的改写，再并行改写，效果不好，还不如原先。
+# 或许可以再增加舍弃后出结果的路径的思路，暂时不尝试
 
 import os
 import time
@@ -233,8 +235,8 @@ def initialize_models(GPU_num):
         # 初始化大模型
         logging.info("正在加载目标模型...")
         models["target"] = LLM(
-            model="Qwen/QwQ-32B",
-            # model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
+            # model="Qwen/QwQ-32B",
+            model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
             tensor_parallel_size=GPU_num,
             gpu_memory_utilization=0.7,
             trust_remote_code=True
@@ -361,6 +363,12 @@ def run_reasoning_process(args, problem, options):
     """运行推理过程"""
     start_time_total = time.time()  # 记录整个过程的开始时间
     
+    # 新增：初始化模型调用计数器
+    model_call_counts = {
+        "draft": 0,  # 小模型调用次数
+        "target": 0  # 大模型调用次数
+    }
+    
     try:
         # 使用大模型选择解题方法，使用args.method_num参数
         solution_methods = choose_solution_methods(problem, options, args.dataset_name, models, args.method_num)
@@ -384,104 +392,41 @@ def run_reasoning_process(args, problem, options):
                 "metadata": [], 
                 "rewrite_count": 0, 
                 "total_steps": 0,
-                "method_code": method_code  # 原始方法代码，不含索引
+                "method_code": method_code,  # 原始方法代码，不含索引
+                "waiting_for_rewrite": False,  # 新增：标记是否在等待改写
+                "current_step_data": None,  # 新增：存储当前步骤的数据
             }
         
         step_id = 0
-        
+        # 新增：等待改写的方法列表
+        waiting_for_rewrite_methods = []
+        # 新增：设置积攒改写的数量阈值，可以通过参数传入
+        # rewrite_batch_size = min(args.method_num, len(method_tracks))  # 默认为方法数量
+        rewrite_batch_size = len(method_tracks) - 2
+
         while True:
             # 检查是否所有轨道都已完成
-            active_methods = [method for method, track in method_tracks.items() if not track["finished"]]
-            if not active_methods:
+            active_methods = [method for method, track in method_tracks.items() 
+                             if not track["finished"] and not track["waiting_for_rewrite"]]
+            
+            # 如果没有活跃方法且没有等待改写的方法，则结束循环
+            if not active_methods and not waiting_for_rewrite_methods:
                 break
                 
-            logging.info(f"[Step {step_id}] 活跃方法: {active_methods}")
+            logging.info(f"[Step {step_id}] 活跃方法: {active_methods}, 等待改写方法: {waiting_for_rewrite_methods}")
             
-            # 1. 为每个活跃方法并行生成下一步推理
-            active_prompts = []
-            method_mapping = []  # 用于跟踪每个提示对应的方法
-            
-            for method in active_methods:
-                track = method_tracks[method]
-                # 获取原始方法代码（不含索引）
-                original_method_code = track["method_code"]
+            # 处理积攒的改写请求
+            if len(waiting_for_rewrite_methods) >= rewrite_batch_size or (not active_methods and waiting_for_rewrite_methods):
+                logging.info(f"[Step {step_id}] 开始批量改写 {len(waiting_for_rewrite_methods)} 个方法")
                 
-                if not track["steps"]:  # 第一步
-                    prompt = get_first_user_msg(problem, options, method_code=original_method_code)
-                else:  # 继续之前的消息
-                    steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
-                    prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
+                # 准备改写提示
+                rewrite_prompts = []
+                rewrite_method_mapping = []
                 
-                active_prompts.append(prompt)
-                method_mapping.append(method)
-            
-            # 设置采样参数
-            sampling_params = SamplingParams(
-                temperature=0.6,
-                top_p=0.95,
-                max_tokens=512,
-                stop=["\n\n"]
-            )
-            
-            # 批量生成小模型的推理步骤
-            small_outputs = models["draft"].generate(active_prompts, sampling_params)
-            
-            # 2. 处理小模型输出并准备评分
-            score_prompts = []
-            score_method_mapping = []
-            small_results = {}
-            
-            for i, output in enumerate(small_outputs):
-                method = method_mapping[i]
-                generated_text = output.outputs[0].text
-                num_tokens = len(output.outputs[0].token_ids)
-                
-                # 检查是否完成
-                finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
-                
-                # 存储小模型结果
-                small_results[method] = {
-                    "text": generated_text,
-                    "tokens": num_tokens,
-                    "finished": finished
-                }
-                
-                # 准备评分提示
-                track = method_tracks[method]
-                steps_for_scoring = track["steps"] + [generated_text]
-                steps_so_far_str = "\n\n".join(steps_for_scoring) + "\n\n"
-                
-                score_prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
-                
-                score_prompts.append(score_prompt)
-                score_method_mapping.append(method)
-            
-            # 3. 批量评分
-            scoring_params = SamplingParams(
-                temperature=0.0,
-                max_tokens=1,
-                logprobs=10
-            )
-            
-            score_outputs = models["target"].generate(score_prompts, scoring_params)
-            
-            # 4. 处理评分结果，确定哪些需要重写
-            rewrite_prompts = []
-            rewrite_method_mapping = []
-            scores = {}
-            
-            for i, output in enumerate(score_outputs):
-                method = score_method_mapping[i]
-                token = output.outputs[0].text
-                logprobs = output.outputs[0].logprobs[0]
-                
-                score = process_vllm_logprobs(token, logprobs, method=args.score_method)
-                scores[method] = score
-                
-                # 如果分数低于阈值，需要重写
-                if score is None or score < args.score_threshold:
-                    logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，需要重写")
+                for method in waiting_for_rewrite_methods:
                     track = method_tracks[method]
+                    original_method_code = track["method_code"]
+                    step_data = track["current_step_data"]
                     
                     if not track["steps"]:  # 第一步
                         prompt = get_first_user_msg(problem, options, method_code=original_method_code)
@@ -491,13 +436,20 @@ def run_reasoning_process(args, problem, options):
                     
                     rewrite_prompts.append(prompt)
                     rewrite_method_mapping.append(method)
-                else:
-                    logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，已接受")
-            
-            # 5. 如果有需要重写的，批量重写
-            rewrite_results = {}
-            if rewrite_prompts:
+                
+                # 设置采样参数
+                sampling_params = SamplingParams(
+                    temperature=0.6,
+                    top_p=0.95,
+                    max_tokens=512,
+                    stop=["\n\n"]
+                )
+                
+                # 批量改写
                 rewrite_outputs = models["target"].generate(rewrite_prompts, sampling_params)
+                # 增加大模型调用计数
+                model_call_counts["target"] += 1
+                rewrite_results = {}
                 
                 for i, output in enumerate(rewrite_outputs):
                     method = rewrite_method_mapping[i]
@@ -512,71 +464,218 @@ def run_reasoning_process(args, problem, options):
                         "tokens": num_tokens,
                         "finished": finished
                     }
-            
-            # 6. 更新每个方法的轨道
-            for method in active_methods:
-                track = method_tracks[method]
                 
-                # 确定最终使用的步骤
-                if method in rewrite_results:
-                    # 使用重写的结果
+                # 更新改写后的轨道
+                for method in rewrite_method_mapping:
+                    track = method_tracks[method]
+                    step_data = track["current_step_data"]
+                    
+                    # 使用改写的结果
                     step_text = rewrite_results[method]["text"]
                     num_tokens = rewrite_results[method]["tokens"]
                     finished = rewrite_results[method]["finished"]
-                    used_base_model = True
-                    # 增加改写计数
+                    
+                    # 增加改写计数和总步骤计数
                     track["rewrite_count"] += 1
-                else:
-                    # 使用小模型的结果
-                    step_text = small_results[method]["text"]
-                    num_tokens = small_results[method]["tokens"]
-                    finished = small_results[method]["finished"]
-                    used_base_model = False
+                    track["total_steps"] += 1
+                    
+                    # 处理特殊情况
+                    if "</think>" in step_text and not any([x in step_text for x in ["boxed", "Answer:", "ANSWER:"]]):
+                        logging.warning(f"Warning: 方法 {method} 的步骤包含 </think>，正在移除")
+                        step_text = step_text.replace("</think>", "")
+                        warning_flag = True
+                    else:
+                        warning_flag = False
+                    
+                    # 添加到轨道的步骤中
+                    track["steps"].append(step_text)
+                    
+                    # 创建元数据
+                    metadata = {
+                        "step_id": step_data["step_id"],
+                        "method_code": track["method_code"],
+                        "step_str": step_text,
+                        "small_model_step": step_data["small_text"],
+                        "num_output_tokens_small": step_data["small_tokens"],
+                        "score": step_data["score"],
+                        "base_model_step": step_text,
+                        "num_output_tokens_base": num_tokens,
+                        "final_num_output_tokens": num_tokens,
+                        "used_base_model": True
+                    }
+                    
+                    if warning_flag:
+                        metadata["warning"] = "step_str had a </think>"
+                    
+                    track["metadata"].append(metadata)
+                    
+                    # 检查是否完成
+                    if finished:
+                        track["finished"] = True
+                        track["stop_reason"] = "finished"
+                    elif len(track["steps"]) > 2 and track["steps"][-1] == track["steps"][-2]:
+                        # 处理重复步骤的边缘情况
+                        track["finished"] = True
+                        track["stop_reason"] = "repeated"
+                    elif sum([m["final_num_output_tokens"] for m in track["metadata"]]) >= args.token_budget:
+                        track["finished"] = True
+                        track["stop_reason"] = "budget"
+                    
+                    # 重置等待状态
+                    track["waiting_for_rewrite"] = False
+                    track["current_step_data"] = None
                 
-                # 增加总步骤计数
-                track["total_steps"] += 1
+                # 清空等待列表
+                waiting_for_rewrite_methods = []
+            
+            # 如果有活跃方法，继续处理
+            if active_methods:
+                # 1. 为每个活跃方法并行生成下一步推理
+                active_prompts = []
+                method_mapping = []  # 用于跟踪每个提示对应的方法
                 
-                # 处理特殊情况
-                if "</think>" in step_text and not any([x in step_text for x in ["boxed", "Answer:", "ANSWER:"]]):
-                    logging.warning(f"Warning: 方法 {method} 的步骤包含 </think>，正在移除")
-                    step_text = step_text.replace("</think>", "")
-                    warning_flag = True
-                else:
-                    warning_flag = False
+                for method in active_methods:
+                    track = method_tracks[method]
+                    # 获取原始方法代码（不含索引）
+                    original_method_code = track["method_code"]
+                    
+                    if not track["steps"]:  # 第一步
+                        prompt = get_first_user_msg(problem, options, method_code=original_method_code)
+                    else:  # 继续之前的消息
+                        steps_so_far_str = "\n\n".join(track["steps"]) + "\n\n"
+                        prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}"
+                    
+                    active_prompts.append(prompt)
+                    method_mapping.append(method)
                 
-                # 添加到轨道的步骤中
-                track["steps"].append(step_text)
+                # 设置采样参数
+                sampling_params = SamplingParams(
+                    temperature=0.6,
+                    top_p=0.95,
+                    max_tokens=512,
+                    stop=["\n\n"]
+                )
                 
-                # 创建元数据
-                metadata = {
-                    "step_id": step_id,
-                    "method_code": original_method_code,
-                    "step_str": step_text,
-                    "small_model_step": small_results[method]["text"],
-                    "num_output_tokens_small": small_results[method]["tokens"],
-                    "score": scores[method],
-                    "base_model_step": rewrite_results.get(method, {}).get("text") if used_base_model else None,
-                    "num_output_tokens_base": rewrite_results.get(method, {}).get("tokens") if used_base_model else None,
-                    "final_num_output_tokens": num_tokens,
-                    "used_base_model": used_base_model
-                }
+                # 批量生成小模型的推理步骤
+                small_outputs = models["draft"].generate(active_prompts, sampling_params)
+                # 增加小模型调用计数
+                model_call_counts["draft"] += 1
                 
-                if warning_flag:
-                    metadata["warning"] = "step_str had a </think>"
+                # 2. 处理小模型输出并准备评分
+                score_prompts = []
+                score_method_mapping = []
+                small_results = {}
                 
-                track["metadata"].append(metadata)
+                for i, output in enumerate(small_outputs):
+                    method = method_mapping[i]
+                    generated_text = output.outputs[0].text
+                    num_tokens = len(output.outputs[0].token_ids)
+                    
+                    # 检查是否完成
+                    finished = any([x in generated_text for x in ["boxed", "Answer:", "ANSWER:"]])
+                    
+                    # 存储小模型结果
+                    small_results[method] = {
+                        "text": generated_text,
+                        "tokens": num_tokens,
+                        "finished": finished
+                    }
+                    
+                    # 准备评分提示
+                    track = method_tracks[method]
+                    steps_for_scoring = track["steps"] + [generated_text]
+                    steps_so_far_str = "\n\n".join(steps_for_scoring) + "\n\n"
+                    
+                    score_prompt = f"{get_first_user_msg(problem, options, method_code=original_method_code)}\n<think>{steps_so_far_str}\nEvaluate the last reasoning step solely based on factual correctness and logical validity. Ignore style, phrasing, or overall usefulness—only judge whether the step is objectively correct and logically follows from prior steps. Assign a score from 0 to 9.\n<think>I think the quality score is: "
+                    
+                    score_prompts.append(score_prompt)
+                    score_method_mapping.append(method)
                 
-                # 检查是否完成
-                if finished:
-                    track["finished"] = True
-                    track["stop_reason"] = "finished"
-                elif len(track["steps"]) > 2 and track["steps"][-1] == track["steps"][-2]:
-                    # 处理重复步骤的边缘情况
-                    track["finished"] = True
-                    track["stop_reason"] = "repeated"
-                elif sum([m["final_num_output_tokens"] for m in track["metadata"]]) >= args.token_budget:
-                    track["finished"] = True
-                    track["stop_reason"] = "budget"
+                # 3. 批量评分
+                scoring_params = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=1,
+                    logprobs=10
+                )
+                
+                score_outputs = models["target"].generate(score_prompts, scoring_params)
+                
+                # 4. 处理评分结果，确定哪些需要重写
+                for i, output in enumerate(score_outputs):
+                    method = score_method_mapping[i]
+                    token = output.outputs[0].text
+                    logprobs = output.outputs[0].logprobs[0]
+                    
+                    score = process_vllm_logprobs(token, logprobs, method=args.score_method)
+                    
+                    # 如果分数低于阈值，需要重写
+                    if score is None or score < args.score_threshold:
+                        logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，需要改写，加入等待队列")
+                        track = method_tracks[method]
+                        
+                        # 标记为等待改写状态
+                        track["waiting_for_rewrite"] = True
+                        # 存储当前步骤数据
+                        track["current_step_data"] = {
+                            "step_id": step_id,
+                            "small_text": small_results[method]["text"],
+                            "small_tokens": small_results[method]["tokens"],
+                            "score": score
+                        }
+                        # 加入等待改写列表
+                        waiting_for_rewrite_methods.append(method)
+                    else:
+                        logging.info(f"[Step {step_id}] 方法 {method} 分数 {score}，已接受")
+                        # 直接使用小模型结果
+                        track = method_tracks[method]
+                        step_text = small_results[method]["text"]
+                        num_tokens = small_results[method]["tokens"]
+                        finished = small_results[method]["finished"]
+                        
+                        # 增加总步骤计数
+                        track["total_steps"] += 1
+                        
+                        # 处理特殊情况
+                        if "</think>" in step_text and not any([x in step_text for x in ["boxed", "Answer:", "ANSWER:"]]):
+                            logging.warning(f"Warning: 方法 {method} 的步骤包含 </think>，正在移除")
+                            step_text = step_text.replace("</think>", "")
+                            warning_flag = True
+                        else:
+                            warning_flag = False
+                        
+                        # 添加到轨道的步骤中
+                        track["steps"].append(step_text)
+                        
+                        # 创建元数据
+                        metadata = {
+                            "step_id": step_id,
+                            "method_code": track["method_code"],
+                            "step_str": step_text,
+                            "small_model_step": step_text,
+                            "num_output_tokens_small": num_tokens,
+                            "score": score,
+                            "base_model_step": None,
+                            "num_output_tokens_base": None,
+                            "final_num_output_tokens": num_tokens,
+                            "used_base_model": False
+                        }
+                        
+                        if warning_flag:
+                            metadata["warning"] = "step_str had a </think>"
+                        
+                        track["metadata"].append(metadata)
+                        
+                        # 检查是否完成
+                        if finished:
+                            track["finished"] = True
+                            track["stop_reason"] = "finished"
+                        elif len(track["steps"]) > 2 and track["steps"][-1] == track["steps"][-2]:
+                            # 处理重复步骤的边缘情况
+                            track["finished"] = True
+                            track["stop_reason"] = "repeated"
+                        elif sum([m["final_num_output_tokens"] for m in track["metadata"]]) >= args.token_budget:
+                            track["finished"] = True
+                            track["stop_reason"] = "budget"
             
             step_id += 1
 
@@ -584,7 +683,6 @@ def run_reasoning_process(args, problem, options):
         total_time = time.time() - start_time_total
 
         # 计算改写率
-        # rewrite_rates = {}
         total_rewrite_rate = 0.0
         valid_methods = 0
         
@@ -606,9 +704,9 @@ def run_reasoning_process(args, problem, options):
         total_time = 0
         avg_rewrite_rate = 0
          
-    return method_tracks, total_time, avg_rewrite_rate
+    return method_tracks, total_time, avg_rewrite_rate, model_call_counts  # 修改返回值，增加模型调用计数
 
-def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options):
+def process_results(method_tracks, total_time, avg_rewrite_rate, model_call_counts, args, problem, options):
     """处理结果并保存"""
     # 合并所有方法的元数据
     all_metadata = []
@@ -651,7 +749,8 @@ def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, 
         "score_threshold": args.score_threshold,
         "token_budget": args.token_budget,
         "score_method": args.score_method,
-        "avg_rewrite_rate": avg_rewrite_rate
+        "avg_rewrite_rate": avg_rewrite_rate,
+        "model_call_counts": model_call_counts
     }
     
     return metadata_with_stats
@@ -709,10 +808,11 @@ def main():
             problem, options = prepare_problem_data(args)
             
             # 运行推理过程
-            method_tracks, total_time, avg_rewrite_rate = run_reasoning_process(args, problem, options)
+            # 在主函数或调用run_reasoning_process的地方
+            method_tracks, total_time, avg_rewrite_rate, model_call_counts = run_reasoning_process(args, problem, options)
             
             # 处理结果
-            metadata_with_stats = process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options)
+            metadata_with_stats = process_results(method_tracks, total_time, avg_rewrite_rate, model_call_counts, args, problem, options)
             
             # 保存结果
             save_results(metadata_with_stats, output_filename)

@@ -1,28 +1,167 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# python spec_scale_reason_2_watch.py --dataset_name aime --problem_id 60 --repeat_id 2 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
 
 import os
 import time
-# import openai
 import pickle
 import pprint
 import logging
 import argparse
 import numpy as np
-# from openai import OpenAI
-# import statistics
 from collections import Counter
-# from tqdm import tqdm
-# from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
 import re
-# import random
+import subprocess
+import psutil
+import threading
+import json
+from datetime import datetime
 # 导入choose-prompts模块中的选择prompt
 from prompts.choose_prompts import math_choose_prompt, gpqa_choose_prompt
 from prompts.method_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+class ResourceMonitor:
+    """资源监控类，用于监控GPU和CPU使用情况"""
+    
+    def __init__(self, interval=1.0, gpu_ids=None):
+        """
+        初始化资源监控器
+        
+        Args:
+            interval: 采样间隔（秒）
+            gpu_ids: 要监控的GPU ID列表，默认为None（监控所有可用GPU）
+        """
+        self.interval = interval
+        self.gpu_ids = gpu_ids
+        self.running = False
+        self.thread = None
+        self.gpu_memory_usage = []
+        self.gpu_utilization = []
+        self.cpu_usage = []
+        self.timestamp = []
+        self.lock = threading.Lock()
+        
+    def get_gpu_info(self):
+        """获取GPU信息"""
+        try:
+            # 使用nvidia-smi命令获取GPU信息
+            cmd = "nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits"
+            output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
+            lines = output.split('\n')
+            
+            gpu_info = {}
+            for line in lines:
+                parts = line.split(',')
+                if len(parts) >= 3:
+                    gpu_id = int(parts[0].strip())
+                    if self.gpu_ids is None or gpu_id in self.gpu_ids:
+                        memory_used = int(parts[1].strip())
+                        gpu_util = int(parts[2].strip())
+                        gpu_info[gpu_id] = {
+                            'memory_used': memory_used,  # MB
+                            'utilization': gpu_util      # %
+                        }
+            return gpu_info
+        except Exception as e:
+            logging.error(f"获取GPU信息失败: {e}")
+            return {}
+    
+    def monitor_resources(self):
+        """资源监控主循环"""
+        while self.running:
+            try:
+                # 获取当前时间戳
+                current_time = datetime.now()
+                
+                # 获取GPU信息
+                gpu_info = self.get_gpu_info()
+                
+                # 获取CPU使用率
+                cpu_percent = psutil.cpu_percent(interval=None)
+                
+                # 计算平均GPU内存使用和利用率
+                avg_gpu_memory = 0
+                avg_gpu_util = 0
+                
+                if gpu_info:
+                    memory_values = [info['memory_used'] for info in gpu_info.values()]
+                    util_values = [info['utilization'] for info in gpu_info.values()]
+                    avg_gpu_memory = sum(memory_values) / len(memory_values)
+                    avg_gpu_util = sum(util_values) / len(util_values)
+                
+                # 加锁更新数据
+                with self.lock:
+                    self.gpu_memory_usage.append(avg_gpu_memory)
+                    self.gpu_utilization.append(avg_gpu_util)
+                    self.cpu_usage.append(cpu_percent)
+                    self.timestamp.append(current_time)
+                
+                # 等待下一个采样间隔
+                time.sleep(self.interval)
+            except Exception as e:
+                logging.error(f"资源监控异常: {e}")
+                time.sleep(self.interval)
+    
+    def start(self):
+        """开始监控"""
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self.monitor_resources)
+            self.thread.daemon = True
+            self.thread.start()
+            logging.info("资源监控已启动")
+    
+    def stop(self):
+        """停止监控"""
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+            self.thread = None
+        logging.info("资源监控已停止")
+    
+    def get_stats(self):
+        """获取统计数据"""
+        with self.lock:
+            if not self.gpu_memory_usage:
+                return {
+                    'avg_gpu_memory_mb': 0,
+                    'max_gpu_memory_mb': 0,
+                    'avg_gpu_utilization': 0,
+                    'max_gpu_utilization': 0,
+                    'avg_cpu_usage': 0,
+                    'max_cpu_usage': 0,
+                    'samples': 0
+                }
+            
+            stats = {
+                'avg_gpu_memory_mb': sum(self.gpu_memory_usage) / len(self.gpu_memory_usage),
+                'max_gpu_memory_mb': max(self.gpu_memory_usage),
+                'avg_gpu_utilization': sum(self.gpu_utilization) / len(self.gpu_utilization),
+                'max_gpu_utilization': max(self.gpu_utilization),
+                'avg_cpu_usage': sum(self.cpu_usage) / len(self.cpu_usage),
+                'max_cpu_usage': max(self.cpu_usage),
+                'samples': len(self.gpu_memory_usage)
+            }
+            return stats
+    
+    def save_to_file(self, filename):
+        """保存监控数据到文件"""
+        with self.lock:
+            data = {
+                'timestamp': [ts.strftime('%Y-%m-%d %H:%M:%S.%f') for ts in self.timestamp],
+                'gpu_memory_mb': self.gpu_memory_usage,
+                'gpu_utilization': self.gpu_utilization,
+                'cpu_usage': self.cpu_usage,
+                'stats': self.get_stats()
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logging.info(f"资源监控数据已保存到 {filename}")
 
 # 新增函数: 获取方法提示
 def get_method_prompt(method_code):
@@ -233,8 +372,8 @@ def initialize_models(GPU_num):
         # 初始化大模型
         logging.info("正在加载目标模型...")
         models["target"] = LLM(
-            model="Qwen/QwQ-32B",
-            # model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
+            # model="Qwen/QwQ-32B",
+            model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
             tensor_parallel_size=GPU_num,
             gpu_memory_utilization=0.7,
             trust_remote_code=True
@@ -361,9 +500,21 @@ def run_reasoning_process(args, problem, options):
     """运行推理过程"""
     start_time_total = time.time()  # 记录整个过程的开始时间
     
+    # 初始化资源监控器
+    resource_monitor = ResourceMonitor(interval=1.0, gpu_ids=[0, 1, 2, 3])
+    resource_monitor.start()
+    
+    # 初始化模型调用计数器
+    model_call_counts = {
+        "draft": 0,  # 小模型调用次数
+        "target": 0  # 大模型调用次数
+    }
+    
     try:
         # 使用大模型选择解题方法，使用args.method_num参数
         solution_methods = choose_solution_methods(problem, options, args.dataset_name, models, args.method_num)
+        # 增加大模型调用计数
+        model_call_counts["target"] += 1
         
         # 为每个方法创建独立的推理轨道，使用索引区分相同方法的不同实例
         method_tracks = {}
@@ -425,6 +576,8 @@ def run_reasoning_process(args, problem, options):
             
             # 批量生成小模型的推理步骤
             small_outputs = models["draft"].generate(active_prompts, sampling_params)
+            # 增加小模型调用计数
+            model_call_counts["draft"] += 1
             
             # 2. 处理小模型输出并准备评分
             score_prompts = []
@@ -583,76 +736,104 @@ def run_reasoning_process(args, problem, options):
         # 计算总时间
         total_time = time.time() - start_time_total
 
+        # 停止资源监控
+        resource_monitor.stop()
+        
+        # 获取资源使用统计
+        resource_stats = resource_monitor.get_stats()
+        
         # 计算改写率
-        # rewrite_rates = {}
-        total_rewrite_rate = 0.0
-        valid_methods = 0
+        total_steps = sum(track["total_steps"] for track in method_tracks.values())
+        total_rewrites = sum(track["rewrite_count"] for track in method_tracks.values())
+        avg_rewrite_rate = (total_rewrites / total_steps) * 100 if total_steps > 0 else 0
         
-        for method, track in method_tracks.items():
-            if track["total_steps"] > 0:
-                rewrite_rate = track["rewrite_count"] / track["total_steps"] * 100
-                track["rewrite_rate"] = rewrite_rate
-                total_rewrite_rate += rewrite_rate
-                valid_methods += 1
-                logging.info(f"方法 {method} 改写率: {rewrite_rate:.2f}% ({track['rewrite_count']}/{track['total_steps']})")
-        
-        # 计算平均改写率
-        avg_rewrite_rate = total_rewrite_rate / valid_methods if valid_methods > 0 else 0
-        logging.info(f"平均改写率: {avg_rewrite_rate:.2f}%")
+        # 记录资源使用情况
+        logging.info(f"平均GPU内存使用: {resource_stats['avg_gpu_memory_mb']:.2f} MB")
+        logging.info(f"最大GPU内存使用: {resource_stats['max_gpu_memory_mb']:.2f} MB")
+        logging.info(f"平均GPU利用率: {resource_stats['avg_gpu_utilization']:.2f}%")
+        logging.info(f"最大GPU利用率: {resource_stats['max_gpu_utilization']:.2f}%")
+        logging.info(f"平均CPU使用率: {resource_stats['avg_cpu_usage']:.2f}%")
+        logging.info(f"最大CPU使用率: {resource_stats['max_cpu_usage']:.2f}%")
+        logging.info(f"小模型调用次数: {model_call_counts['draft']}")
+        logging.info(f"大模型调用次数: {model_call_counts['target']}")
+        logging.info(f"总调用次数: {model_call_counts['draft'] + model_call_counts['target']}")
 
     except ValueError as e:
         logging.error(f"ValueError caught in chat template application: {e}")
         method_tracks = {}
         total_time = 0
         avg_rewrite_rate = 0
+        resource_stats = {}
+        model_call_counts = {"draft": 0, "target": 0}
+        
+        # 确保停止资源监控
+        resource_monitor.stop()
          
-    return method_tracks, total_time, avg_rewrite_rate
+    return method_tracks, total_time, avg_rewrite_rate, resource_stats, model_call_counts
 
-def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options):
-    """处理结果并保存"""
-    # 合并所有方法的元数据
-    all_metadata = []
+def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options, resource_stats=None, model_call_counts=None):
+    """处理推理结果，提取答案和统计信息"""
+    results = []
+    
     for method, track in method_tracks.items():
-        for metadata in track["metadata"]:
-            all_metadata.append(metadata)
-
-    # 为每个方法选择最终结果
-    final_results = {}
-    for method, track in method_tracks.items():
-        if track["finished"]:
-            # 提取答案
-            answer = extract_final_answer("\n\n".join(track["steps"]), args.dataset_name)
+        if track["steps"]:
+            final_reasoning = "\n\n".join(track["steps"])
+            answer = extract_final_answer(final_reasoning, args.dataset_name)
             
-            final_results[method] = {
+            # 计算token数量
+            num_tokens = sum(m.get("num_tokens", 0) for m in track["metadata"])
+            
+            # 确定停止原因
+            if track["finished"]:
+                stop_reason = "finished"
+            elif num_tokens >= args.token_budget:
+                stop_reason = "budget"
+            else:
+                stop_reason = "unknown"
+            
+            result = {
+                "method": method,
+                "method_code": track["method_code"],
                 "steps": track["steps"],
+                "metadata": track["metadata"],
+                "final_reasoning": final_reasoning,
                 "answer": answer,
-                "stop_reason": track.get("stop_reason", "unknown"),
-                "num_tokens": sum([m["final_num_output_tokens"] for m in track["metadata"]]),
-                "num_steps": len(track["steps"]),
-                "method_code": track["method_code"]  # 记录使用的方法代码
+                "num_tokens": num_tokens,
+                "rewrite_count": track["rewrite_count"],
+                "total_steps": track["total_steps"],
+                "rewrite_rate": (track["rewrite_count"] / track["total_steps"]) * 100 if track["total_steps"] > 0 else 0,
+                "stop_reason": stop_reason
             }
-
+            results.append(result)
+    
     # 选择最佳结果
-    best_result = select_best_result(list(final_results.values()))
-
-    # 添加统计信息
+    best_result = select_best_result(results)
+    
+    # 创建包含统计信息的元数据
     metadata_with_stats = {
-        "problem_id": args.problem_id,
-        "repeat_id": args.repeat_id,
-        "dataset_name": args.dataset_name,
         "problem": problem,
         "options": options,
-        "method_num": args.method_num,  # 记录使用的方法数量
-        "solution_methods": list(method_tracks.keys()),  # 记录使用的解题方法
-        "method_tracks": method_tracks,
-        "final_results": final_results,
-        "best_result": best_result,
+        "dataset_name": args.dataset_name,
+        "problem_id": args.problem_id,
+        "repeat_id": args.repeat_id,
         "total_time": total_time,
+        "avg_rewrite_rate": avg_rewrite_rate,
         "score_threshold": args.score_threshold,
         "token_budget": args.token_budget,
         "score_method": args.score_method,
-        "avg_rewrite_rate": avg_rewrite_rate
+        "method_num": args.method_num,
+        "results": results,
+        "best_result": best_result,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
     }
+    
+    # 添加资源统计信息
+    if resource_stats:
+        metadata_with_stats["resource_stats"] = resource_stats
+    
+    # 添加模型调用次数
+    if model_call_counts:
+        metadata_with_stats["model_call_counts"] = model_call_counts
     
     return metadata_with_stats
 
@@ -709,10 +890,10 @@ def main():
             problem, options = prepare_problem_data(args)
             
             # 运行推理过程
-            method_tracks, total_time, avg_rewrite_rate = run_reasoning_process(args, problem, options)
+            method_tracks, total_time, avg_rewrite_rate, resource_stats, model_call_counts = run_reasoning_process(args, problem, options)
             
             # 处理结果
-            metadata_with_stats = process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options)
+            metadata_with_stats = process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, options, resource_stats, model_call_counts)
             
             # 保存结果
             save_results(metadata_with_stats, output_filename)

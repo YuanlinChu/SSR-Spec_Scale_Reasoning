@@ -1,22 +1,16 @@
 # python spec_scale_reason_2_mp.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_mp --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 5
-
+# vllm的python原生接口-多进程版本，效果不好
 import os
 import time
-import openai
 import pickle
 import pprint
 import logging
 import argparse
 import numpy as np
-from openai import OpenAI
-import statistics
 from collections import Counter
-from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
 import re
-import random
 import multiprocessing
 from multiprocessing import Process, Queue, Manager
 # 导入choose-prompts模块中的选择prompt
@@ -213,15 +207,16 @@ def initialize_models_global(GPU_num):
         models_global["draft"] = LLM(
             model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             tensor_parallel_size=GPU_num,
-            gpu_memory_utilization=0.1, # 调整以适应多进程共享
+            gpu_memory_utilization=0.15, # 调整以适应多进程共享
             trust_remote_code=True
         )
         
         logging.info("正在加载目标模型...")
         models_global["target"] = LLM(
-            model="Qwen/QwQ-32B",
+            # model="Qwen/QwQ-32B",
+            model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
             tensor_parallel_size=GPU_num,
-            gpu_memory_utilization=0.8, # 调整以适应多进程共享
+            gpu_memory_utilization=0.75, # 调整以适应多进程共享
             trust_remote_code=True
         )
         logging.info("全局模型初始化完成")
@@ -282,7 +277,7 @@ def prepare_problem_data(args):
         }
     return problem, options
 
-def choose_solution_methods(problem, options, dataset_name, model_proxy, method_num=3):
+def choose_solution_methods(problem, options, dataset_name, method_num=3):
     """选择最合适的解题方法 (使用模型代理)"""
     logging.info(f"选择{method_num}个解题方法...")
     
@@ -306,10 +301,16 @@ def choose_solution_methods(problem, options, dataset_name, model_proxy, method_
         max_tokens=method_num * 2 -1,
     )
     
-    # 使用模型代理进行推理
-    request_id = f"choose_methods_{time.time()}" # 唯一的请求ID
-    outputs = model_proxy.generate_on_target([prompt], sampling_params, request_id) # 假设 model_proxy 有此方法
+    outputs = models_global["target"].generate(
+        prompts=[prompt],
+        sampling_params=sampling_params
+    )
     method_text = outputs[0].outputs[0].text.strip()
+
+    # 使用模型代理进行推理
+    # request_id = f"choose_methods_{time.time()}" # 唯一的请求ID
+    # outputs = model_proxy.generate_on_target([prompt], sampling_params, request_id) # 假设 model_proxy 有此方法
+    # method_text = outputs[0].outputs[0].text.strip()
     
     print(method_text)
 
@@ -363,7 +364,6 @@ class ModelProxy:
 
     def generate_on_target(self, prompts, sampling_params, request_id_suffix="target_gen"):
         return self._send_request("target", prompts, sampling_params, request_id_suffix)
-
 
 def run_one_track_process(track_id, method_code_with_index, original_method_code, problem, options, args_dict, request_q, result_q_map):
     """在单个进程中运行一个推理轨道"""
@@ -505,7 +505,6 @@ def run_one_track_process(track_id, method_code_with_index, original_method_code
     logging.info(f"[Track {track_id}] Finished. Reason: {track_data.get('stop_reason', 'N/A')}")
     return track_data
 
-
 def model_server_process(request_q, result_q_map_dict_proxy, num_tracks):
     """专门用于处理模型推理请求的进程"""
     logging.info("Model server process started.")
@@ -631,25 +630,25 @@ def run_reasoning_process_multiprocess(args, problem, options):
     # For now, we'll assume it's handled and request_queue_global is ready.
 
     # 临时的ModelProxy для choose_solution_methods. 它需要自己的结果队列。
-    choose_method_track_id = "choose_methods_process"
-    choose_method_result_q = manager.Queue()
-    result_queues_proxy_for_server[choose_method_track_id] = choose_method_result_q
-    temp_model_proxy = ModelProxy(request_queue_global, result_queues_proxy_for_server, choose_method_track_id)
+    # choose_method_track_id = "choose_methods_process"
+    # choose_method_result_q = manager.Queue()
+    # result_queues_proxy_for_server[choose_method_track_id] = choose_method_result_q
+    # temp_model_proxy = ModelProxy(request_queue_global, result_queues_proxy_for_server, choose_method_track_id)
 
 
     try:
-        solution_methods_codes = choose_solution_methods(problem, options, args.dataset_name, temp_model_proxy, args.method_num)
+        solution_methods_codes = choose_solution_methods(problem, options, args.dataset_name, args.method_num)
     except Exception as e:
         logging.error(f"Error in choose_solution_methods: {e}. Skipping problem.")
         # Clean up the temporary queue for choose_methods
-        if choose_method_track_id in result_queues_proxy_for_server:
-            del result_queues_proxy_for_server[choose_method_track_id]
-        return {}, 0, 0
+    #     if choose_method_track_id in result_queues_proxy_for_server:
+    #         del result_queues_proxy_for_server[choose_method_track_id]
+    #     return {}, 0, 0
 
 
-    # Clean up the temporary queue for choose_methods
-    if choose_method_track_id in result_queues_proxy_for_server:
-        del result_queues_proxy_for_server[choose_method_track_id]
+    # # Clean up the temporary queue for choose_methods
+    # if choose_method_track_id in result_queues_proxy_for_server:
+    #     del result_queues_proxy_for_server[choose_method_track_id]
 
 
     method_tracks_info = {} # To store (original_method_code, track_id_with_index)
@@ -838,7 +837,7 @@ def run_reasoning_process_multiprocess(args, problem, options):
                         else:
                             logging.error(f"Async result format error or None: {track_result_data}")
                     except TimeoutError:
-                        logging.error(f"A track process timed out.")
+                        logging.error("A track process timed out.")
                     except Exception as e:
                         logging.error(f"Error getting result from a track process: {e}")
                 pool.close()
@@ -968,7 +967,47 @@ def main():
     model_server = Process(target=model_server_process, args=(request_queue_global, result_queues_dict_proxy_for_server, num_tracks_for_server))
     model_server.start()
     logging.info("Model server process launched.")
-
+    
+    # 测试多进程推理系统
+    def test_reasoning_multiprocess():
+        """
+        测试多进程推理系统是否正常工作
+        这个函数展示了如何使用多进程推理系统进行简单的推理任务
+        """
+        logging.info("开始测试多进程推理系统...")
+        
+        # 创建测试用的结果队列
+        test_result_queue = manager.Queue()
+        result_queues_dict_proxy_for_server["test_track"] = test_result_queue
+        
+        # 创建模型代理
+        test_proxy = ModelProxy(request_queue_global, {"test_track": test_result_queue}, "test_track")
+        
+        # 测试小模型
+        test_prompt = "计算 2 + 2 的结果是多少？"
+        test_params = SamplingParams(temperature=0.0, max_tokens=10)
+        
+        try:
+            logging.info("测试小模型推理...")
+            small_result = test_proxy.generate_on_draft([test_prompt], test_params, "test_small")
+            logging.info(f"小模型推理结果: {small_result[0].outputs[0].text}")
+            
+            logging.info("测试大模型推理...")
+            large_result = test_proxy.generate_on_target([test_prompt], test_params, "test_large")
+            logging.info(f"大模型推理结果: {large_result[0].outputs[0].text}")
+            
+            logging.info("多进程推理系统测试成功！")
+            return True
+        except Exception as e:
+            logging.error(f"多进程推理系统测试失败: {e}")
+            return False
+    
+    # 运行测试
+    if test_reasoning_multiprocess():
+        logging.info("继续执行主程序...")
+    else:
+        logging.error("多进程推理系统测试失败，程序终止")
+        exit(1)
 
     # 加载数据集
     args.dataset = get_dataset(args.dataset_name)
@@ -1042,7 +1081,7 @@ def main():
     # In this case, `manager` objects in `run_reasoning_process_multiprocess` are local to its call.
     # The `manager` in `main` for the global queues will be cleaned up when main exits.
 
-    logging.info(f"所有任务完成！")
+    logging.info("所有任务完成！")
 
 if __name__ == "__main__":
     # multiprocessing.set_start_method('spawn', force=True) # Good for CUDA safety, might be default on some OS

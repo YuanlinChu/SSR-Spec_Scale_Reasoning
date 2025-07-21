@@ -2,9 +2,13 @@
 results/
 logs/
 previous/
+dataset/
 plots/
 
 # Python 编译生成的缓存文件
 __pycache__/
 *.py[cod]
 *$py.class
+
+# 忽略所有日志文件
+*.log
