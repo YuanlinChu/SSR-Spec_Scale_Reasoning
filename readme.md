@@ -5,7 +5,6 @@ Large language models (LLMs) have achieved impressive results on multi-step math
 ![SSR Framework](SSR_Framework.png)
 
 ## Project Structure
-## Project Structure
 
 ### reason
 
