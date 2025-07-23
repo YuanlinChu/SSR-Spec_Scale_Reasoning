@@ -1,6 +1,6 @@
-#python parallel_eval.py --dataset_name live --model_name QwQ-32B --results_dir results/scale_reason_r3_noprompt --plot
+#python eval/parallel_eval.py --dataset_name live --model_name QwQ-32B --results_dir results/scale_reason_r3_noprompt --plot
 #这个代码是评估准确率随着并行数量的变化（用pass@k来代表），分析到了一定数量后再增加就收效不大了
-
+#python eval/parallel_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/scale_reason --plot
 import os
 import re
 import pickle
@@ -283,11 +283,12 @@ def evaluate_model(args):
 
     # 遍历结果文件
     for filename in os.listdir(model_dir):
-        if not filename.endswith(".pickle") and not filename.endswith(".txt"):
+        # 只处理pickle文件，跳过txt文件
+        if not filename.endswith(".pickle"):
             continue
             
         # 解析文件名获取问题ID和重复ID
-        match = re.match(r"(\d+)-(\d+)\.(pickle|txt)", filename)
+        match = re.match(r"(\d+)-(\d+)\.pickle", filename)
         if not match:
             logging.warning(f"跳过无法解析的文件名: {filename}")
             continue
@@ -311,20 +312,16 @@ def evaluate_model(args):
         file_path = os.path.join(model_dir, filename)
         try:
             with open(file_path, "rb") as f:
-                try:
-                    data = pickle.load(f)
-                except Exception as e:
-                    logging.error(f"无法解析文件 {file_path}: {e}")
-                    continue
+                data = pickle.load(f)
                     
             # 提取数据中的运行结果
-            run_results = data.get("time_stats", {}).get("run_results", [])
-            if not run_results:
+            method_results = data.get("time_stats", {}).get("method_results", [])
+            if not method_results:
                 logging.warning(f"在文件 {file_path} 中未找到运行结果")
                 continue
                 
             # 处理每个运行结果
-            for run_id, result in enumerate(run_results):
+            for run_id, result in enumerate(method_results):
                 model_answer = result.get("answer")
                 
                 # 如果model_answer不存在，直接判定为错误

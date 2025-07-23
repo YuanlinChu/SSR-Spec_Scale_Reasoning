@@ -1,4 +1,5 @@
-# python scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name Qwen/QwQ-32B --output_dir results/scale_reason --use_role_prompts
+# python ablation_exp/scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name Qwen/QwQ-32B --output_dir results/scale_reason --use_method_prompts --method_num 3
+# python ablation_exp/scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --model_name /hpc2hdd/home/yfan546/.cache/modelscope/hub/models/Qwen/QwQ-32B --output_dir results/scale_reason --use_method_prompts --method_num 3
 
 import os
 import time
@@ -13,34 +14,52 @@ from collections import Counter
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
 from vllm import LLM, SamplingParams
-from prompts.role_prompts import role_prompt_1, role_prompt_2, role_prompt_3
+# 导入choose-prompts模块中的选择prompt
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from prompts.choose_prompts import math_choose_prompt
+from prompts.method_prompt import A_prompt, B_prompt, C_prompt, D_prompt, E_prompt, F_prompt, G_prompt, H_prompt, I_prompt, J_prompt, K_prompt, L_prompt, M_prompt
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # 初始化全局模型
 model = None
 
-def get_first_user_msg(problem, options=None, role_type=None):
-    # 根据role_type选择不同的角色提示
-    role_prompt = None
-    if role_type == 1:
-        role_prompt = role_prompt_1
-    elif role_type == 2:
-        role_prompt = role_prompt_2
-    elif role_type == 3:
-        role_prompt = role_prompt_3
-    
+# 新增函数: 获取方法提示
+def get_method_prompt(method_code):
+    """根据方法代码返回对应的方法提示"""
+    method_prompts = {
+        'A': A_prompt,
+        'B': B_prompt,
+        'C': C_prompt,
+        'D': D_prompt,
+        'E': E_prompt,
+        'F': F_prompt,
+        'G': G_prompt,
+        'H': H_prompt,
+        'I': I_prompt,
+        'J': J_prompt,
+        'K': K_prompt,
+        'L': L_prompt,
+        'M': M_prompt
+    }
+    return method_prompts.get(method_code, M_prompt)
+
+def get_first_user_msg(problem, options=None, method_code=None):
+    # 获取解题方法提示
+    method_prompt = get_method_prompt(method_code) if method_code else M_prompt
+        
     if options is None:
         system_prompt = """
         Solve the following math problem efficiently and clearly. Please reason step by step, 
         separate logical reasoning steps with two newline characters (\n\n), and put your final answer within \\boxed{{}}.
+        
+        Tips: {method_prompt}
+        
         Problem: {problem}
         """
-        if role_prompt:
-            combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-            return combined_prompt.format(problem=problem)
-        else:
-            return system_prompt.format(problem=problem)
+        return system_prompt.format(method_prompt=method_prompt, problem=problem)
     else:
         system_prompt = """
         What is the correct answer to the following problem? Please reason step by step. 
@@ -48,6 +67,8 @@ def get_first_user_msg(problem, options=None, role_type=None):
         Put the final answer **strictly** in the format \\boxed{{X}}, where X is a single letter (A, B, C, or D).
 
         **Example output:** \\boxed{{A}}
+        
+        Tips: {method_prompt}
 
         Problem: {problem}.
         Choices: 
@@ -56,25 +77,84 @@ def get_first_user_msg(problem, options=None, role_type=None):
         (C) {ans_c}
         (D) {ans_d}
         """
-        if role_prompt:
-            combined_prompt = f"{role_prompt}\n\n{system_prompt}"
-            return combined_prompt.format(
-                problem=problem,
-                ans_a=options["A"],
-                ans_b=options["B"],
-                ans_c=options["C"],
-                ans_d=options["D"],
-            )
-        else:
-            return system_prompt.format(
-                problem=problem,
-                ans_a=options["A"],
-                ans_b=options["B"],
-                ans_c=options["C"],
-                ans_d=options["D"],
-            )
+        return system_prompt.format(
+            method_prompt=method_prompt,
+            problem=problem,
+            ans_a=options["A"],
+            ans_b=options["B"],
+            ans_c=options["C"],
+            ans_d=options["D"],
+        )
 
-def generate_full_reasoning_batch(problem, options=None, max_tokens=8192, use_role_prompts=False, dataset_name=None):
+def choose_solution_methods(problem, options, dataset_name, model, method_num=3):
+    """选择最合适的解题方法
+    
+    Args:
+        problem: 问题文本
+        options: 选项（如有）
+        dataset_name: 数据集名称
+        model: 模型实例
+        method_num: 需要选择的解题方法数量，默认为3
+        
+    Returns:
+        包含方法代码的列表
+    """
+    logging.info(f"选择{method_num}个解题方法...")
+    
+    # 选择合适的prompt
+    if dataset_name == "aime" or dataset_name == "math" or dataset_name == "live":
+        choose_prompt = math_choose_prompt
+    elif dataset_name == "gpqa":
+        # 如果有gpqa_choose_prompt，使用它，否则使用math_choose_prompt
+        try:
+            from prompts.choose_prompts import gpqa_choose_prompt
+            choose_prompt = gpqa_choose_prompt
+        except ImportError:
+            logging.warning(f"未找到gpqa_choose_prompt，使用math_choose_prompt")
+            choose_prompt = math_choose_prompt
+    else:
+        logging.warning(f"未知数据集: {dataset_name}，默认使用math_choose_prompt")
+        choose_prompt = math_choose_prompt
+    
+    # 准备提示，根据method_num调整要求数量
+    prompt = f"{choose_prompt}\n\nProblem: {problem}"
+    if options:
+        prompt += "\nChoices: "
+        for key, value in options.items():
+            prompt += f"\n({key}) {value}"
+    prompt = f"{prompt}\n\nExamine the problem and select the **{method_num}** strategies (by their codes, e.g. {'B,E,F' if method_num == 3 else 'B,E,F,A' if method_num == 4 else 'B,E'}) that you believe are most promising for solving it. You only need to output {method_num} codes, without any other symbols or text\n<think></think>I think the best {method_num} methods are: "
+    
+    # 设置生成参数，根据method_num调整max_tokens
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=method_num * 2-1,  # 每个方法可能需要2个token（字母+逗号）
+    )
+    
+    # 使用模型生成方法选择
+    outputs = model.generate([prompt], sampling_params)
+    method_text = outputs[0].outputs[0].text.strip()
+    
+    # print(prompt)
+    print(method_text)
+
+    # 提取方法代码
+    methods_match = re.findall(r'[A-M]', method_text)
+    
+    # 如果提取的方法数量不足，使用'M'填充
+    if len(methods_match) < method_num:
+        logging.warning(f"从'{method_text}'中只提取到{len(methods_match)}个方法代码，不足{method_num}个，使用'M'填充")
+        while len(methods_match) < method_num:
+            methods_match.append('M')
+    elif len(methods_match) > method_num:
+        # 如果提取的方法数量超过需要的数量，截取前method_num个
+        logging.warning(f"从'{method_text}'中提取到{len(methods_match)}个方法代码，超过{method_num}个，只使用前{method_num}个")
+        methods_match = methods_match[:method_num]
+    
+    logging.info(f"选择的解题方法: {''.join(methods_match)}")
+
+    return methods_match
+
+def generate_full_reasoning_batch(problem, options=None, max_tokens=8192, use_method_prompts=False, dataset_name=None, method_num=3):
     """批量生成完整的推理过程"""
     global model
     
@@ -82,14 +162,19 @@ def generate_full_reasoning_batch(problem, options=None, max_tokens=8192, use_ro
     
     # 准备提示列表
     prompts = []
-    if use_role_prompts:
-        # 使用三种不同的角色提示
-        for role_type in [1, 2, 3]:
-            prompts.append(get_first_user_msg(problem, options, role_type))
+    method_codes = []
+    
+    if use_method_prompts:
+        # 使用模型选择解题方法
+        selected_methods = choose_solution_methods(problem, options, dataset_name, model, method_num)
+        for method_code in selected_methods:
+            prompts.append(get_first_user_msg(problem, options, method_code))
+            method_codes.append(method_code)
     else:
-        # 不使用角色提示，但仍生成三次
-        for _ in range(3):
+        # 不使用方法提示，但仍生成method_num次
+        for _ in range(method_num):
             prompts.append(get_first_user_msg(problem, options))
+            method_codes.append(None)
     
     # 设置采样参数
     sampling_params = SamplingParams(
@@ -122,9 +207,9 @@ def generate_full_reasoning_batch(problem, options=None, max_tokens=8192, use_ro
             "token_time": time_per_token,  # 毫秒/token
         }
         
-        # 如果使用角色提示，添加角色类型
-        if use_role_prompts:
-            result["role_type"] = i + 1
+        # 如果使用方法提示，添加方法代码
+        if use_method_prompts:
+            result["method_code"] = method_codes[i]
         else:
             result["run_id"] = i
             
@@ -185,8 +270,9 @@ def run_baseline_test(args, problem_id, repeat_id):
             problem, 
             options=options, 
             max_tokens=args.token_budget,
-            use_role_prompts=args.use_role_prompts,
-            dataset_name=args.dataset_name
+            use_method_prompts=args.use_method_prompts,
+            dataset_name=args.dataset_name,
+            method_num=args.method_num
         )
         
         # 选择最终答案
@@ -200,7 +286,7 @@ def run_baseline_test(args, problem_id, repeat_id):
     total_time = time.time() - start_time_total
 
     # 添加时间统计信息到元数据
-    if args.use_role_prompts:
+    if args.use_method_prompts:
         time_stats = {
             "total_time": total_time,
             "model_stats": {
@@ -210,8 +296,8 @@ def run_baseline_test(args, problem_id, repeat_id):
                 "token_time": statistics.mean([r["token_time"] for r in results]),  # 毫秒/token
             },
             "total_tokens": sum(r["num_tokens"] for r in results),
-            "role_results": results,
-            "selected_role": final_result.get("role_type") if final_result else None,
+            "method_results": results,
+            "selected_method": final_result.get("method_code") if final_result else None,
             "selection_reason": final_result.get("selection_reason") if final_result else "所有推理都失败"
         }
     else:
@@ -237,10 +323,10 @@ def run_baseline_test(args, problem_id, repeat_id):
     logging.info(f"模型名称: {args.model_name}")
     logging.info(f"并行推理时间: {results[0]['elapsed_time']:.2f}秒 ({(results[0]['elapsed_time']/total_time)*100:.2f}%)")
     
-    if args.use_role_prompts:
+    if args.use_method_prompts:
         logging.info(f"模型生成:")
         for result in results:
-            logging.info(f"  角色 {result['role_type']}:")
+            logging.info(f"  方法 {result['method_code']}:")
             logging.info(f"    - 总token数: {result['num_tokens']}")
             logging.info(f"    - 是否完成: {result['finished']}")
             logging.info(f"    - 停止原因: {result.get('stop_reason', '未知')}")
@@ -248,7 +334,7 @@ def run_baseline_test(args, problem_id, repeat_id):
                 logging.info(f"    - 答案: {result['answer']}")
         
         if final_result:
-            logging.info(f"选择的角色: {final_result['role_type']}")
+            logging.info(f"选择的方法: {final_result['method_code']}")
             logging.info(f"选择原因: {final_result['selection_reason']}")
             logging.info(f"最终答案: {final_result.get('answer', '无法提取')}")
         else:
@@ -256,7 +342,7 @@ def run_baseline_test(args, problem_id, repeat_id):
     else:
         logging.info(f"模型生成:")
         for result in results:
-            logging.info(f"  运行 {result['run_id']+1}/3:")
+            logging.info(f"  运行 {result['run_id']+1}/{args.method_num}:")
             logging.info(f"    - 总token数: {result['num_tokens']}")
             logging.info(f"    - 是否完成: {result['finished']}")
             logging.info(f"    - 停止原因: {result.get('stop_reason', '未知')}")
@@ -264,7 +350,7 @@ def run_baseline_test(args, problem_id, repeat_id):
                 logging.info(f"    - 答案: {result['answer']}")
         
         if final_result:
-            logging.info(f"选择的运行: {final_result['run_id']+1}/3")
+            logging.info(f"选择的运行: {final_result['run_id']+1}/{args.method_num}")
             logging.info(f"选择原因: {final_result['selection_reason']}")
             logging.info(f"最终答案: {final_result.get('answer', '无法提取')}")
         else:
@@ -458,8 +544,10 @@ def main():
                         help="张量并行大小")
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.8,
                         help="GPU内存利用率")
-    parser.add_argument("--use_role_prompts", action="store_true",
-                        help="是否使用角色提示（使用三种不同的角色提示并选择最佳结果）")
+    parser.add_argument("--use_method_prompts", action="store_true",
+                        help="是否使用方法提示（使用模型选择解题方法并并行推理）")
+    parser.add_argument("--method_num", type=int, default=3,
+                        help="需要选择的解题方法数量（默认：3）")
     args, _ = parser.parse_known_args()
     
     # 初始化全局模型
@@ -482,6 +570,10 @@ def main():
     completed_tasks = 0
     
     logging.info(f"开始处理 {len(problem_ids)} 个问题，每个问题重复 {args.repeat_id} 次，共 {total_tasks} 个任务")
+    if args.use_method_prompts:
+        logging.info(f"使用方法提示模式，每次选择 {args.method_num} 个解题方法")
+    else:
+        logging.info(f"使用基础模式，每次生成 {args.method_num} 个推理结果")
     
     for problem_id in problem_ids:
         for repeat_idx in range(args.repeat_id):

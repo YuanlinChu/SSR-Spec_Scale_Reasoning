@@ -41,6 +41,8 @@ Large language models (LLMs) have achieved impressive results on multi-step math
 ```bash
 git clone https://github.com/YuanlinChu/SSR-Spec_Scale_Reasoning.git
 cd SSR-Spec_Scale_Reasoning
+conda create -n ssr python=3.12
+conda activate ssr
 pip install -r requirements.txt
 ```
 

@@ -1,4 +1,5 @@
 # python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# 旧版本：答案聚合策略是多数投票，票数相同取token多的
 
 import os
 import time
@@ -112,13 +113,7 @@ def process_vllm_logprobs(token, logprobs, method, temp=1.0):
         raise NotImplementedError
 
 def select_best_result(results):
-    """根据指定规则选择最佳结果
-    
-    策略：
-    1. 默认使用Majority Voting：选择最频繁的答案
-    2. 在平局或所有答案都不同的情况下，使用基于分数的投票机制：
-       计算每条路径的平均步骤分数，选择平均分数最高的路径
-    """
+    """根据指定规则选择最佳结果"""
     # 过滤出成功完成的结果
     finished_results = [r for r in results if r.get("stop_reason") == "finished" and r.get("answer") is not None]
     
@@ -130,43 +125,20 @@ def select_best_result(results):
     answers = [r.get("answer") for r in finished_results]
     answer_counts = Counter(answers)
     
-    # 检查是否有明确的多数答案
-    most_common_answer, max_count = answer_counts.most_common(1)[0]
+    # 如果有答案相同的，取多数
+    if len(answer_counts) < len(finished_results):
+        most_common_answer, count = answer_counts.most_common(1)[0]
+        if count > 1:  # 确保至少有两个相同答案
+            # 找出具有最常见答案的所有结果
+            selected_results = [r for r in finished_results if r.get("answer") == most_common_answer]
+            # 从中选择token数最多的
+            selected_result = max(selected_results, key=lambda r: r.get("num_tokens", 0))
+            selected_result["selection_reason"] = f"多数原则: {count}/{len(finished_results)}个结果给出相同答案"
+            return selected_result
     
-    # 如果有唯一的多数答案（不是平局）
-    if max_count > 1 and len([count for count in answer_counts.values() if count == max_count]) == 1:
-        # 找出具有最常见答案的所有结果
-        selected_results = [r for r in finished_results if r.get("answer") == most_common_answer]
-        # 从中选择token数最多的
-        selected_result = max(selected_results, key=lambda r: r.get("num_tokens", 0))
-        selected_result["selection_reason"] = f"多数原则: {max_count}/{len(finished_results)}个结果给出相同答案"
-        return selected_result
-    
-    # 平局或所有答案都不同的情况：使用基于平均分数的投票机制
-    logging.info("检测到平局或答案各不相同，使用基于平均分数的投票机制")
-    
-    # 为每个结果计算平均步骤分数
-    def calculate_avg_score(result):
-        """计算结果的平均SPM分数（用于答案聚合）"""
-        return result.get("avg_spm_score", 0.0)
-    
-    # 显示每个结果的平均分数
-    for result in finished_results:
-        method_code = result.get("method_code", "未知")
-        avg_spm_score = calculate_avg_score(result)
-        avg_original_score = result.get("avg_score", 0.0)
-        answer = result.get("answer")
-        logging.info(f"方法 {method_code}: 答案={answer}, 原始平均分数={avg_original_score:.2f}, SPM平均分数={avg_spm_score:.2f}")
-    
-    # 计算每个结果的平均分数并选择最高的
-    selected_result = max(finished_results, key=calculate_avg_score)
-    avg_score = calculate_avg_score(selected_result)
-    
-    if max_count > 1:
-        selected_result["selection_reason"] = f"平局情况下基于平均分数选择 (平均分数: {avg_score:.2f})"
-    else:
-        selected_result["selection_reason"] = f"答案各不相同，基于平均分数选择 (平均分数: {avg_score:.2f})"
-    
+    # 如果答案各不相同，取token数最多的
+    selected_result = max(finished_results, key=lambda r: r.get("num_tokens", 0))
+    selected_result["selection_reason"] = "答案各不相同，选择token数最多的结果"
     return selected_result
 
 def extract_final_answer(reasoning, dataset_name):
@@ -264,6 +236,7 @@ def initialize_models(GPU_num):
         models["target"] = LLM(
             model="Qwen/QwQ-32B",
             # model="/hpc2hdd/home/bwang423/.cache/modelscope/hub/models/Qwen/QwQ-32B",
+            # model="/hpc2hdd/home/yfan546/.cache/modelscope/hub/models/Qwen/QwQ-32B",
             tensor_parallel_size=GPU_num,
             gpu_memory_utilization=0.7,
             trust_remote_code=True
@@ -576,12 +549,6 @@ def run_reasoning_process(args, problem, options):
                 # 添加到轨道的步骤中
                 track["steps"].append(step_text)
                 
-                # 确定SPM优化分数：重写的步骤分配9分，未重写的使用原始评分
-                spm_score = 9.0 if used_base_model else scores[method]
-                
-                if used_base_model:
-                    logging.info(f"[Step {step_id}] 方法 {method} 使用重写步骤，SPM分数从 {scores[method]} 调整为 9.0")
-                
                 # 创建元数据
                 metadata = {
                     "step_id": step_id,
@@ -589,8 +556,7 @@ def run_reasoning_process(args, problem, options):
                     "step_str": step_text,
                     "small_model_step": small_results[method]["text"],
                     "num_output_tokens_small": small_results[method]["tokens"],
-                    "score": scores[method],  # 保持原始评分
-                    "spm_score": spm_score,  # SPM优化分数，用于答案聚合
+                    "score": scores[method],
                     "base_model_step": rewrite_results.get(method, {}).get("text") if used_base_model else None,
                     "num_output_tokens_base": rewrite_results.get(method, {}).get("tokens") if used_base_model else None,
                     "final_num_output_tokens": num_tokens,
@@ -659,23 +625,13 @@ def process_results(method_tracks, total_time, avg_rewrite_rate, args, problem, 
             # 提取答案
             answer = extract_final_answer("\n\n".join(track["steps"]), args.dataset_name)
             
-            # 计算平均步骤分数
-            scores = [m.get("score") for m in track["metadata"] if m.get("score") is not None]
-            spm_scores = [m.get("spm_score") for m in track["metadata"] if m.get("spm_score") is not None]
-            avg_score = sum(scores) / len(scores) if scores else 0.0
-            avg_spm_score = sum(spm_scores) / len(spm_scores) if spm_scores else 0.0
-            
             final_results[method] = {
                 "steps": track["steps"],
                 "answer": answer,
                 "stop_reason": track.get("stop_reason", "unknown"),
                 "num_tokens": sum([m["final_num_output_tokens"] for m in track["metadata"]]),
                 "num_steps": len(track["steps"]),
-                "method_code": track["method_code"],  # 记录使用的方法代码
-                "avg_score": avg_score,  # 原始平均分数
-                "avg_spm_score": avg_spm_score,  # SPM平均分数，用于答案聚合
-                "step_scores": scores,  # 原始分数列表
-                "spm_step_scores": spm_scores  # SPM分数列表
+                "method_code": track["method_code"]  # 记录使用的方法代码
             }
 
     # 选择最佳结果

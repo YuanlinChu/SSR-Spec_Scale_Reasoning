@@ -1,5 +1,5 @@
 # python spec_scale_reason.py --dataset_name aime --problem_id 60 --repeat_id 1 --output_dir results/spec_scale_Inf --score_threshold 7.0 --token_budget 8192 --score_method greedy
-
+# 早期的role_prompt版本
 import os
 import time
 import openai
