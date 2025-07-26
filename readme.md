@@ -82,4 +82,4 @@ python spec_eval.py --dataset_name aime --model_name QwQ-32b --results_dir resul
 This project supports a variety of mathematical reasoning datasets:
 - AIME (American Invitational Mathematics Competition)
 - MATH (Complex Mathematics Problem Set)
-- GPQA (Multiple Choice Question Answering)
+- LivemathBench (Mathematical Competition Problems)
