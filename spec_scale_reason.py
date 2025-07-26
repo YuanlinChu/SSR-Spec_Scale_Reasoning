@@ -1,4 +1,4 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# python spec_scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
 
 import os
 import time
@@ -298,7 +298,7 @@ def parse_arguments():
                         help="Repeat ID (1-16, k=16)")
     parser.add_argument("--score_method", type=str, choices=["greedy", "average"], default="greedy",
                         help="Scoring method")
-    parser.add_argument("--output_dir", type=str, default="results/spec_scale_Inf", 
+    parser.add_argument("--output_dir", type=str, default="results/spec_scale", 
                         help="Where result pickle files will be written to")
     parser.add_argument("--tensor_parallel_size", type=int, default=4,
                         help="Tensor parallel size for model initialization")
@@ -728,7 +728,7 @@ def main():
     problem_ids = parse_problem_range(args.problem_id)
     
     # 准备输出目录
-    output_dir = os.path.join(args.output_dir, args.dataset_name)
+    output_dir = os.path.join(args.output_dir + f"_m{args.method_num}_t{args.score_threshold}", args.dataset_name)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     

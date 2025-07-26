@@ -1,4 +1,4 @@
-# python spec_scale_reason_2.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
+# python spec_scale_reason.py --dataset_name aime --problem_id 60-89 --repeat_id 3 --output_dir results/spec_scale_2 --score_threshold 7.0 --token_budget 8192 --score_method greedy --method_num 3
 # 旧版本：答案聚合策略是多数投票，票数相同取token多的
 
 import os
