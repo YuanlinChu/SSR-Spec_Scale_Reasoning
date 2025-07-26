@@ -1,9 +1,6 @@
-import logging
 from collections import defaultdict
 from typing import Any, Dict
-
 import numpy as np
-
 
 def _pass_at_k(n, c, k):
     """
