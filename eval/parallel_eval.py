@@ -280,6 +280,13 @@ def evaluate_model(args):
     total_attempts = 0  # 所有尝试的次数
     problems_with_correct = 0  # 至少有一次正确的问题数
     problem_to_scores = defaultdict(list)  # 每个问题的正确/错误列表
+    
+    # 初始化reasoning答案的统计数据
+    reasoning_problem_stats = {}  # 每个问题的reasoning答案统计信息
+    reasoning_total_correct = 0   # reasoning答案所有正确的次数
+    reasoning_total_attempts = 0  # reasoning答案所有尝试的次数
+    reasoning_problems_with_correct = 0  # reasoning答案至少有一次正确的问题数
+    reasoning_problem_to_scores = defaultdict(list)  # 每个问题的reasoning答案正确/错误列表
 
     # 遍历结果文件
     for filename in os.listdir(model_dir):
@@ -320,6 +327,35 @@ def evaluate_model(args):
                 logging.warning(f"在文件 {file_path} 中未找到运行结果")
                 continue
                 
+            # 处理reasoning字段中的答案（每个文件只处理一次）
+            reasoning_data = data.get("reasoning")  # 从data顶层获取reasoning
+            reasoning_answer = None
+            reasoning_is_correct = False
+            
+            if reasoning_data and isinstance(reasoning_data, dict):
+                reasoning_answer = reasoning_data.get("answer")
+                if reasoning_answer is not None:
+                    reasoning_is_correct = compare_answers(reasoning_answer, ground_truth, args.dataset_name)
+            
+            # 记录reasoning答案的详细结果
+            if reasoning_answer is not None and not reasoning_is_correct:
+                logging.info(f"问题 {problem_id}（索引 {problem_idx}），重复 {repeat_id} [Reasoning]: 模型='{reasoning_answer}'，正确答案='{ground_truth}'，判断={reasoning_is_correct}")
+            
+            # 更新reasoning答案的统计信息
+            if reasoning_answer is not None:
+                if problem_id not in reasoning_problem_stats:
+                    reasoning_problem_stats[problem_id] = {"attempts": 0, "correct": 0}
+                    
+                reasoning_problem_stats[problem_id]["attempts"] += 1
+                if reasoning_is_correct:
+                    reasoning_problem_stats[problem_id]["correct"] += 1
+                    reasoning_total_correct += 1
+                    
+                reasoning_total_attempts += 1
+                
+                # 为reasoning答案的pass@k计算添加结果
+                reasoning_problem_to_scores[problem_id].append(reasoning_is_correct)
+            
             # 处理每个运行结果
             for run_id, result in enumerate(method_results):
                 model_answer = result.get("answer")
@@ -356,6 +392,11 @@ def evaluate_model(args):
     for problem_id, stats in problem_stats.items():
         if stats["correct"] > 0:
             problems_with_correct += 1
+            
+    # 计算reasoning答案每个问题是否至少有一次正确
+    for problem_id, stats in reasoning_problem_stats.items():
+        if stats["correct"] > 0:
+            reasoning_problems_with_correct += 1
 
     # 计算准确率
     total_problems = len(problem_stats)
@@ -368,6 +409,18 @@ def evaluate_model(args):
         accuracy_method2 = (total_correct / total_attempts) * 100
     else:
         accuracy_method2 = 0
+        
+    # 计算reasoning答案的准确率
+    reasoning_total_problems = len(reasoning_problem_stats)
+    if reasoning_total_problems > 0:
+        reasoning_accuracy_method1 = (reasoning_problems_with_correct / reasoning_total_problems) * 100
+    else:
+        reasoning_accuracy_method1 = 0
+        
+    if reasoning_total_attempts > 0:
+        reasoning_accuracy_method2 = (reasoning_total_correct / reasoning_total_attempts) * 100
+    else:
+        reasoning_accuracy_method2 = 0
 
     # 打印结果
     logging.info("=" * 50)
@@ -375,28 +428,57 @@ def evaluate_model(args):
     logging.info(f"数据集: {args.dataset_name}")
     logging.info(f"模型: {args.model_name}")
     logging.info(f"结果目录: {model_dir}")
+    logging.info("")
+    logging.info("原始答案统计:")
     logging.info(f"总问题数: {total_problems}")
     logging.info(f"总尝试次数: {total_attempts}")
     logging.info(f"总正确次数: {total_correct}")
     logging.info(f"至少有一次正确的问题数: {problems_with_correct}")
     logging.info(f"(至少一次正确的问题/总问题数): {accuracy_method1:.2f}%")
     logging.info(f"(总正确次数/总尝试次数): {accuracy_method2:.2f}%")
+    logging.info("")
+    logging.info("Reasoning答案统计:")
+    logging.info(f"总问题数: {reasoning_total_problems}")
+    logging.info(f"总尝试次数: {reasoning_total_attempts}")
+    logging.info(f"总正确次数: {reasoning_total_correct}")
+    logging.info(f"至少有一次正确的问题数: {reasoning_problems_with_correct}")
+    logging.info(f"(至少一次正确的问题/总问题数): {reasoning_accuracy_method1:.2f}%")
+    logging.info(f"(总正确次数/总尝试次数): {reasoning_accuracy_method2:.2f}%")
     logging.info("=" * 50)
     
     # 打印每个问题的详细统计信息
-    logging.info("每个问题的详细统计信息:")
+    logging.info("每个问题的原始答案详细统计信息:")
     for problem_id in sorted(problem_stats.keys()):
         stats = problem_stats[problem_id]
         logging.info(f"问题 {problem_id}: 尝试={stats['attempts']}, 正确={stats['correct']}, 正确率={stats['correct']/stats['attempts']*100:.2f}%")
     
+    # 打印reasoning答案的详细统计信息
+    if reasoning_problem_stats:
+        logging.info("")
+        logging.info("每个问题的Reasoning答案详细统计信息:")
+        for problem_id in sorted(reasoning_problem_stats.keys()):
+            stats = reasoning_problem_stats[problem_id]
+            logging.info(f"问题 {problem_id}: 尝试={stats['attempts']}, 正确={stats['correct']}, 正确率={stats['correct']/stats['attempts']*100:.2f}%")
+    
     # 计算pass@k
     pass_k_results = calculate_pass_at_k(problem_to_scores, max_k=9)
     
+    # 计算reasoning答案的pass@k
+    reasoning_pass_k_results = {}
+    if reasoning_problem_to_scores:
+        reasoning_pass_k_results = calculate_pass_at_k(reasoning_problem_to_scores, max_k=9)
+    
     # 打印pass@k结果
     logging.info("=" * 50)
-    logging.info("Pass@k 结果:")
+    logging.info("原始答案 Pass@k 结果:")
     for k, value in pass_k_results.items():
         logging.info(f"Pass@{k}: {value:.2f}%")
+    
+    if reasoning_pass_k_results:
+        logging.info("")
+        logging.info("Reasoning答案 Pass@k 结果:")
+        for k, value in reasoning_pass_k_results.items():
+            logging.info(f"Pass@{k}: {value:.2f}%")
     logging.info("=" * 50)
     
     # 绘制pass@k折线图
@@ -414,7 +496,15 @@ def evaluate_model(args):
         "accuracy_method1": accuracy_method1,
         "accuracy_method2": accuracy_method2,
         "problem_stats": problem_stats,
-        "pass_at_k": pass_k_results
+        "pass_at_k": pass_k_results,
+        "reasoning_total_problems": reasoning_total_problems,
+        "reasoning_total_attempts": reasoning_total_attempts,
+        "reasoning_total_correct": reasoning_total_correct,
+        "reasoning_problems_with_correct": reasoning_problems_with_correct,
+        "reasoning_accuracy_method1": reasoning_accuracy_method1,
+        "reasoning_accuracy_method2": reasoning_accuracy_method2,
+        "reasoning_problem_stats": reasoning_problem_stats,
+        "reasoning_pass_at_k": reasoning_pass_k_results
     }
 
 def main():
