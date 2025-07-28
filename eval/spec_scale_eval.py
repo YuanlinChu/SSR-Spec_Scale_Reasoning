@@ -1,4 +1,4 @@
-# python spec_scale_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/spec_scale_m
+# python eval/spec_scale_eval.py --dataset_name aime --model_name QwQ-32B --results_dir results/spec_scale_m
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# python rewrite_token_stats_eval.py --dataset_name aime --results_dir results/spec_scale_2_m5_t7
+# python eval/rewrite_token_stats_eval.py --dataset_name aime --results_dir results/spec_scale_m5_t7
 import os
 import re
 import pickle

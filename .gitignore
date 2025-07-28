@@ -12,3 +12,4 @@ __pycache__/
 
 # 忽略所有日志文件
 *.log
+_log.txt
